@@ -1,0 +1,8 @@
+# Actor image for the jevmon lab: the second lab container (background scenarios live here).
+# Minimal on purpose - a plain userspace with coreutils; it runs only on the lab's internal
+# network and nothing outside the pod is ever touched.
+FROM docker.io/library/ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+CMD ["sleep", "infinity"]

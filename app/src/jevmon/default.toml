@@ -1,0 +1,128 @@
+# jevmon default configuration.
+#
+# Copy this file to $XDG_CONFIG_HOME/jevmon/config.toml (usually
+# ~/.config/jevmon/config.toml) and edit it to override. Only the keys you set
+# need to be present; unknown keys are rejected so typos fail loudly.
+#
+# There are no process name/path lists anywhere: the model judges. This file
+# only tunes the poller, the context text and the model's question/calibration.
+
+[exec]
+# Event source. "proc" polls a /proc tree (the shipped default); "replay" re-emits a recorded
+# JSON-lines stream from `replay_file`, one event per `interval` seconds - a deterministic
+# stand-in for demos, tests and screenshots, with no real processes involved.
+source = "proc"
+replay_file = ""
+# Also read each parent's command line (one extra /proc read per exec) for the `parent_cmd`
+# context segment. Off: that segment did not help the judge.
+parent_argv = false
+# Launch-time per-process facts to read, one extra pass of /proc reads per new exec (names:
+# exe_state, argv0_vs_exe, stdio, session, workdir, cgroup_path, privileges, namespaces,
+# exe_file). Empty = none. They are facts for the model to read, not rules; show them to the
+# model by adding the same names to [context] order (a name in `order` must be listed here).
+facts = []
+# Poll interval in seconds and its bounds. The source widens the effective
+# interval when it exceeds the CPU budget and shrinks it back when it does not.
+interval = 0.05
+min_interval = 0.05
+max_interval = 5.0
+# Hard budget as a fraction of one core, measured with time.thread_time (the poller's own thread,
+# so the model's CPU cannot make the poller back off).
+cpu_budget = 0.03
+# Bounds on work per scan.
+max_pids = 20000
+max_tracked = 5000
+# How often a summary event (observed/missed/interval/percentiles) is emitted.
+summary_seconds = 30.0
+
+[context]
+# The model sees at most this many characters of state.
+model_max = 1000
+# Add-alpha smoothing for surprisal over learned counts.
+surprisal_alpha = 0.5
+# Window for the box's own recent rarity distribution.
+rarity_window_seconds = 3600.0
+# Max argv tokens kept in the masked template.
+template_tokens = 24
+# An exe file modified within this many seconds of exec counts as recent.
+recent_write_seconds = 300.0
+# Window for the "siblings" fact: execs seen under the same parent pid in this many seconds.
+sibling_seconds = 10.0
+# What the model reads: the segment names in order (a name left out is not rendered).
+# Shipped = the command only (header, exe, argv template, argv) - that is what won the
+# zero-shot sweep in docs/finetune.md; the statistics below are still computed, stored in
+# the event's fields and used in the memoisation signature. Empty list = every segment.
+order = ["header", "exe", "template", "argv"]
+# Display order of environment variables when an environment segment is shown: these names come
+# first, in this order, then the rest. This is a display order, not a judging rule.
+env_priority = ["LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "PATH", "PYTHONPATH", "PYTHONSTARTUP", "NODE_OPTIONS", "PERL5OPT", "RUBYOPT", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "SHELL"]
+# Separator between segments (" " = one line, "\n" = one segment per line).
+sep = " "
+# Cap on the value of the argv segment, in characters.
+argv_max = 300
+
+[judge]
+# Which judge runs. "laya" is the shipped model; "fake" is a deterministic stand-in with no
+# model, no GPU and no judgement - a stable hash of the context over the classes below, with
+# verdict summaries prefixed `mock:`. For demos, tests and screenshot runs.
+mode = "laya"
+# Prompt content for the model's choice question.
+question = "Which of these categories best describes this process launch?"
+# Fine-tuned classification head over the frozen encoder: a .safetensors file written by
+# lab/scripts/train_head_v3 / finetune_head. A bare name ("lab-head-v4") is a head shipped in
+# the package (src/jevmon/laya/heads/); anything with a directory or suffix is a file path.
+# Empty = the zero-shot model decides. A broken path degrades to zero-shot and says so in
+# `ctl status`.
+tuned = "lab-head-v4"
+# Checkpoint the judge answers from: a built-in name ("english", "multilingual",
+# "typed-decisions") or a local fine-tune registered through checkpoint_dir below.
+checkpoint = "english"
+# Local directory of a fine-tune (a laya-train output, e.g. models/lab-ft), registered as
+# `checkpoint`. Empty = the built-in source. A path that will not register falls back to the
+# built-in english checkpoint and says so in `ctl status`.
+checkpoint_dir = ""
+# How long a memoised decision for an unchanged context signature is reused.
+memo_ttl_seconds = 300.0
+# Bounded judge queue (contexts are small, so this is generous); full-queue contexts are counted
+# and stored judged=false. A deep queue means stale verdicts: watch queue_age in `ctl status`.
+queue_capacity = 50000
+# Model device: "auto" runs the model on the iGPU when a working HIP device is present (needs
+# the opt-in PyTorch ROCm wheel, `just gpu-sync`) and on CPU otherwise; "cpu"/"gpu" force
+# it. Any GPU failure at load or inference time falls back to CPU and is visible in
+# `ctl status` (judge_device / model_status); the worker never dies over it.
+device = "auto"
+# Autocast precision: "auto" (laya default: bf16 on GPU, fp32 on CPU), "fp32", "fp16" or "bf16".
+# Measured: verdicts do not change between these on the same contexts.
+dtype = "auto"
+# Contexts the worker drains per model call. 0 = auto: 32 on the GPU (a forward pass there is
+# mostly fixed cost -- measured bf16 65 ms/ctx single, 55 at drain 8, 44 at 32), 1 on CPU
+# (batching only adds padding there: measured batch 4-32 2-22% slower than 1). The worker
+# never waits to fill a batch, so an idle judge still answers one at a time.
+batch_size = 0
+# torch intra-op threads when the model runs on the CPU (the fallback when no GPU works). A monitor
+# must not peg cores, so this is deliberately small: about 2.5 s per context on two threads against
+# 0.7 s on eight. The judge then falls behind and sheds load (judged=false)
+# instead of burning the machine; the GPU path is what makes it fast. Keep this at or below the
+# service's CPUQuota in cores, or torch thrashes against the quota.
+threads = 2
+# torch intra-op threads while the model is on the GPU: there the CPU only tokenizes and feeds
+# the GPU, so the default stays low -- the whole point of the GPU path is not pegging cores.
+threads_gpu = 2
+
+[judge.categories]
+# The three classes and what each means: the model's answer IS the verdict and its severity
+# (safe 0, warn 1, crit 2), and its confidence is shown beside it with no thresholds on top.
+# jevmon judges at execution time only, so a class describes one launch, not a rate or a trend.
+# Safe means the model saw nothing to act on, not that the launch was verified. Prompt content,
+# generic on purpose: no process names or paths live here.
+safe = "expected everyday activity here: shells, builds, package installs, scheduled jobs, ssh sessions and other development tooling; no action needed"
+warn = "out of the ordinary for this workstation but plausibly harmless: a one-off script, the first run of a newly installed tool, a debugger; worth a glance"
+crit = "looks hostile from the launch alone: downloading and running remote code, encoded or obfuscated commands, execution from a temporary, world-writable or hidden location, a shell spawned by an unexpected parent"
+
+[store]
+# Days of events kept by the SQLite store.
+retention_days = 14
+# Bounded in-memory queue between sources and sinks.
+queue_capacity = 10000
+# Persist exec events (verdict events are always persisted when a store is configured).
+store_exec_events = false

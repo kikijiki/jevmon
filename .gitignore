@@ -1,0 +1,34 @@
+.venv/
+# opt-in GPU envs (just gpu-sync / gpu-sync-lab); the CPU .venv and uv.lock stay the default
+.venv-gpu/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.direnv/
+/models/
+# lab-generated data: synthetic but sizeable, regenerate with `just lab`
+/lab-data/
+/lab-data-smoke/
+.env
+.claude/worktrees/
+# Rust TUI build artefacts (app/tui/target is huge; regenerate with `just tui`)
+/app/tui/target/
+# local experiment tracking store (Trackio, lab/scripts/ + `just runs`)
+/runs/
+# improve-stage experiment artefacts (regenerate with scripts/gen_scenarios.py + just lab)
+/lab-data-r4/
+/lab-data-r5/
+/lab-data-merged/
+/cache/
+*.log
+/lab-data-r6/
+/lab-data-r7/
+/lab-data-3c-*/
+/lab-data-settle-*/
+extra-ids.txt
+/lab-data-ctx-*/
+/lab-data-fx-*/
+/lab-data-facts-smoke/
+/lab-data-gen-*/
+/lab/cache/

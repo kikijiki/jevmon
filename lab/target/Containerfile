@@ -1,0 +1,33 @@
+# Target image for the jevmon lab: a real systemd host with nginx serving a harmless payload
+# script. Built once, then run rootless with --systemd=always, an internal-only network and hard
+# cgroup limits (see src/jevmon/lab/pod.py). Scenario steps run here; the image carries no log or
+# metric tooling - the lab's system under test is the host /proc poller, not journald.
+FROM docker.io/library/ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV container=podman
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        systemd systemd-sysv dbus \
+        nginx \
+        python3 iproute2 procps coreutils util-linux passwd curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# podman exec'd processes land in the container's init.scope, where systemd's 15%-of-pids
+# DefaultTasksMax (38 here) would bind a fork storm long before the container's own --pids-limit.
+# Lift the inner default only: the hard bound stays the container-wide pids limit from pod.py.
+RUN mkdir -p /etc/systemd/system.conf.d \
+    && printf '[Manager]\nDefaultTasksMax=infinity\n' > /etc/systemd/system.conf.d/lab-tasksmax.conf
+
+# Harmless static payload for the download-and-run (curl_pipe) scenarios: the lab's own nginx,
+# loopback only, serving `sleep` and a print. Nothing else is served.
+COPY payload.sh /var/www/lab/payload.sh
+COPY nginx-lab.conf /etc/nginx/sites-available/lab
+RUN rm -f /etc/nginx/sites-enabled/default \
+    && ln -s /etc/nginx/sites-available/lab /etc/nginx/sites-enabled/lab \
+    && chmod 0755 /var/www/lab/payload.sh
+
+RUN systemctl enable nginx.service
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

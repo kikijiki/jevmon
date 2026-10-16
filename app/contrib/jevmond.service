@@ -1,0 +1,32 @@
+[Unit]
+Description=jevmon decision daemon (exec source -> model judge -> store)
+After=default.target
+
+[Service]
+Type=simple
+# repo root, not app/: relative paths in config (models/...) resolve against it; the project is
+# selected with --project app
+WorkingDirectory=%h/dev/jevmon
+# Runs on the iGPU (the ROCm torch wheel in app/.venv-gpu; create it once with `just gpu-sync`, which
+# `just daemon-install` does for you). The flake dev shell supplies LD_LIBRARY_PATH for the
+# wheel's runtime libs. [judge] device = "auto" falls back to the CPU by itself if HIP is
+# unavailable, and says so in `ctl status`. For a CPU-only service use instead:
+#   ExecStart=/run/current-system/sw/bin/nix develop %h/dev/jevmon --command uv run --project app jevmond
+Environment=VIRTUAL_ENV=%h/dev/jevmon/app/.venv-gpu
+ExecStart=/run/current-system/sw/bin/nix develop %h/dev/jevmon --command uv run --project app --active --no-sync jevmond
+Restart=on-failure
+RestartSec=5s
+
+# On the GPU a context costs ~50 ms and at most ~2 cores of CPU (measured).
+# Two cores is a hard ceiling for a background monitor: if the GPU path is unavailable the CPU
+# fallback is slower and sheds load rather than pegging the machine.
+Nice=10
+CPUQuota=200%
+# The model is ~1.7 GiB fp32 wherever it lives; the iGPU path also holds ~4 GiB of weights and
+# activations in GTT (system RAM on this APU), so leave room.
+MemoryMax=8G
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
