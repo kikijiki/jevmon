@@ -152,6 +152,15 @@ class DaemonClient:
     async def reload(self) -> dict:
         return await self.request("reload")
 
+    async def allow_list(self) -> dict:
+        return await self.request("allow_list")
+
+    async def allow_add(self, rule: str) -> dict:
+        return await self.request("allow_add", rule=rule)
+
+    async def allow_remove(self, rule: str) -> dict:
+        return await self.request("allow_remove", rule=rule)
+
     async def shutdown(self) -> dict:
         return await self.request("shutdown")
 
@@ -181,6 +190,12 @@ async def _run_ctl(args: argparse.Namespace) -> dict:
             return await client.pause()
         if command == "resume":
             return await client.resume()
+        if command == "allow":
+            if args.allow_command == "list":
+                return await client.allow_list()
+            if args.allow_command == "add":
+                return await client.allow_add(args.rule)
+            return await client.allow_remove(args.rule)
         if command == "shutdown":
             return await client.shutdown()
         raise DaemonError(f"unknown ctl command {command!r}")

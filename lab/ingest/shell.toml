@@ -1,0 +1,17 @@
+# Shell grammar facts used only to split a command line into the programs it launches.
+# Nothing here is a verdict or feeds a label: a builtin runs inside the shell (no execve of its own),
+# reserved words are syntax. Programs not listed are launched as a child row.
+
+# Words that run inside the shell process: no launch row.
+builtins = [
+  "cd", "pwd", "export", "unset", "set", "shopt", "alias", "unalias", "source", ".", "exit", "return",
+  "read", "eval", "exec", "wait", "umask", "ulimit", "trap", "shift", "test", "[", "[[", "true", "false",
+  ":", "type", "command", "hash", "getopts", "let", "local", "declare", "typeset", "readonly", "echo",
+  "printf", "kill", "fg", "bg", "jobs", "break", "continue", "times", "builtin", "pushd", "popd", "dirs",
+]
+
+# Reserved words stripped from the front of a segment (the command after them is still a program).
+keywords = ["if", "then", "else", "elif", "fi", "do", "done", "while", "until", "esac", "time", "!", "{", "}"]
+
+# A segment starting with one of these is a loop/case header or a definition, not a launch.
+skip_segment = ["for", "case", "select", "function"]

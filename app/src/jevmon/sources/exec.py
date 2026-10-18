@@ -42,14 +42,15 @@ KIND_EXEC = "exec"
 KIND_SUMMARY = "summary"
 
 
-SOURCES = ("proc", "replay")
+SOURCES = ("ebpf", "proc", "replay")
 
 
 @dataclass(frozen=True, slots=True)
 class ExecSettings:
     """Source knobs. Defaults are the shipped `[exec]` values; see `config.py`.
 
-    `source` picks the event source: `proc` polls a `/proc` tree (the shipped default),
+    `source` picks the event source: `ebpf` reads the privileged helper's exec stream (the
+    shipped default, `sources/ebpf.py`), `proc` polls a `/proc` tree without privileges,
     `replay` re-emits a recorded JSON-lines stream from `replay_file` at `interval` seconds per
     event. Replay keeps the rest of the pipeline identical, which is what makes demos, tests and
     screenshot runs reproducible without a real process table.
@@ -63,7 +64,7 @@ class ExecSettings:
     max_pids: int = 20_000
     max_tracked: int = 5_000
     summary_seconds: float = 30.0
-    source: str = "proc"
+    source: str = "ebpf"
     replay_file: str = ""
     # Also read each parent's command line (one more /proc read per exec). Off by default: the
     # `parent_cmd` context segment did not help the judge.
@@ -72,6 +73,18 @@ class ExecSettings:
     # none. They are facts for the model to read, never rules. One extra pass of /proc reads per
     # new exec; the context shows the ones named in `[context] order`.
     facts: tuple[str, ...] = ()
+    # ebpf source only (ignored by the others): the helper's socket, the reconnect backoff bounds
+    # in seconds, and how many recent execs are remembered to name a launch's parent.
+    helper_socket: str = "/run/jevmon/exec.sock"
+    helper_retry_min: float = 0.5
+    helper_retry_max: float = 10.0
+    recent_exec_max: int = 4096
+    # ebpf source: the reader's CPU ceiling as a fraction of one core (thread time); above it the
+    # source stops reading and the helper counts what it could not deliver. 0 = no ceiling.
+    helper_cpu_budget: float = 0.5
+    # Where `jevmon start` finds the helper binary; empty = `jevmon-exec` on PATH, else the build
+    # under app/helper/result.
+    helper_path: str = ""
 
     def __post_init__(self) -> None:
         if self.source not in SOURCES:
@@ -79,6 +92,14 @@ class ExecSettings:
         unknown = set(self.facts) - set(FACT_NAMES)
         if unknown:
             raise ValueError(f"unknown fact(s): {', '.join(sorted(unknown))}")
+        if not self.helper_socket:
+            raise ValueError("helper_socket must not be empty")
+        if not 0 < self.helper_retry_min <= self.helper_retry_max:
+            raise ValueError("need 0 < helper_retry_min <= helper_retry_max")
+        if not 0 <= self.helper_cpu_budget <= 1:
+            raise ValueError("helper_cpu_budget must be between 0 and 1")
+        if self.recent_exec_max < 1:
+            raise ValueError("recent_exec_max must be positive")
         if self.source == "replay" and not self.replay_file:
             raise ValueError("source = 'replay' needs replay_file")
 

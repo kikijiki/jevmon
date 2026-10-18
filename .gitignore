@@ -14,8 +14,6 @@ __pycache__/
 .claude/worktrees/
 # Rust TUI build artefacts (app/tui/target is huge; regenerate with `just tui`)
 /app/tui/target/
-# local experiment tracking store (Trackio, lab/scripts/ + `just runs`)
-/runs/
 # improve-stage experiment artefacts (regenerate with scripts/gen_scenarios.py + just lab)
 /lab-data-r4/
 /lab-data-r5/
@@ -31,4 +29,24 @@ extra-ids.txt
 /lab-data-fx-*/
 /lab-data-facts-smoke/
 /lab-data-gen-*/
+/lab-data-gen2-*/
 /lab/cache/
+app/helper/result
+/lab-data-ext-*/
+# E20 results (regenerate with lab/scripts/train_heads.py)
+/lab-data-e20/
+# E20 research log (kept private, moved into the backstage research log)
+/E20-LOG.md
+# backbone-judge work log (private)
+/BACKBONE-LOG.md
+# raw external datasets, archived lab captures, old probe data (not in the repo)
+/data/
+# LoRA-check outputs (plan, results, adapters, predictions; regenerate with
+# `lab/scripts/lora_check.py` / `--backbone ettin`)
+/lab-data-lora/
+/lab-data-lora-ettin/
+/lab-data-lora-rerun/
+# Trackio local store (`just runs`) and the pod runner's generated files
+/runs/
+/trackio-runs/
+/run_lora.sh

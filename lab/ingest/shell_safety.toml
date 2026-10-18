@@ -1,0 +1,45 @@
+# Label mapping for tomngdev/shell-safety-v1.1 (synthetic allow / ask / deny labels from an
+# agent-permission policy). Keyed on the source's own fields only. First matching rule wins.
+# Rows flagged `uncertain` stay in the test and are reported separately in the sensitivity tables.
+
+source = "shell-safety-v1.1"
+# Which source fields name the family (the generator's own template id) and what to keep.
+family_field = "reason"
+
+[[rule]]
+id = "drop-non-posix"
+when = { shell = ["powershell", "cmd"] }
+to = "drop"
+
+# deny reasons that describe an agent-policy breach rather than a hostile launch
+[[rule]]
+id = "deny-policy"
+when = { label = ["deny"], reason = [
+  "git_sensitive_commit", "repoint_registry", "prod_ssh", "tree_wide_discard", "irreversible_delete",
+  "secret_store_write", "secret_to_stdout", "iam_grant", "vendor_patch", "sudo_destructive", "block_device",
+] }
+to = "crit"
+uncertain = "deny for agent policy (secrets, prod, destructive), not necessarily hostile"
+
+[[rule]]
+id = "deny"
+when = { label = ["deny"] }
+to = "crit"
+
+[[rule]]
+id = "ask"
+when = { label = ["ask"] }
+to = "warn"
+uncertain = "ask is an agent-permission prompt, not 'unusual for a workstation'"
+
+# allow reasons whose safety depends on agent session context that a launch does not carry
+[[rule]]
+id = "allow-context"
+when = { label = ["allow"], reason = ["agent_touched_delete", "git_push_remote", "declared_dependency"] }
+to = "safe"
+uncertain = "allow depends on agent session context (files the agent touched, declared deps)"
+
+[[rule]]
+id = "allow"
+when = { label = ["allow"] }
+to = "safe"

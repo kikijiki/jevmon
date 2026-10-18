@@ -63,10 +63,51 @@ def test_load_reports_missing_and_malformed_files(tmp_path) -> None:
 def test_shipped_default_head_loads_with_the_three_classes() -> None:
     from jevmon.config import load_config
 
-    name = load_config().judge.tuned
-    loaded = TunedHead.load(name)
+    cfg = load_config().judge
+    assert cfg.model == "laya" and cfg.tuned == ""
+    loaded = TunedHead.load(cfg.model)
     assert set(loaded.labels) == {"safe", "warn", "crit"}
     assert loaded.weight.shape[0] == 3 and np.isfinite(loaded.weight).all()
+
+
+def test_variants_backbone_and_metrics_round_trip(tmp_path) -> None:
+    path = tmp_path / "backbone.safetensors"
+    TunedHead(
+        labels=LABELS,
+        weight=np.zeros((3, 8), dtype=np.float32),
+        bias=np.asarray((0.0, 0.0, 9.0), dtype=np.float32),
+        backbone="Qwen/Qwen3-Embedding-8B",
+        variants=("mean", "mean75"),
+        recipe="logreg/wd0.1/bal",
+        training_set="mixed pool",
+        metrics=(("lab/pool", 0.5), ("splunk/reviewed", 0.4)),
+    ).save(path)
+    loaded = TunedHead.load(path)
+    assert loaded.feature_variants == ("mean", "mean75")
+    assert loaded.backbone == "Qwen/Qwen3-Embedding-8B"
+    assert loaded.recipe == "logreg/wd0.1/bal" and loaded.training_set == "mixed pool"
+    assert dict(loaded.metrics) == {"lab/pool": 0.5, "splunk/reviewed": 0.4}
+
+
+def test_legacy_pooling_derives_variants() -> None:
+    assert head().feature_variants == ("mean",)
+    combined = TunedHead(
+        labels=LABELS,
+        weight=np.zeros((3, 4), dtype=np.float32),
+        bias=np.zeros(3, dtype=np.float32),
+        pooling="mean+cls",
+    )
+    assert combined.feature_variants == ("mean", "cls")
+
+
+def test_unknown_feature_variant_is_refused() -> None:
+    with pytest.raises(HeadLoadError, match="feature variant"):
+        TunedHead(
+            labels=LABELS,
+            weight=np.zeros((3, 4), dtype=np.float32),
+            bias=np.zeros(3, dtype=np.float32),
+            variants=("bogus",),
+        )
 
 
 def test_wrong_format_version_and_missing_metadata_are_refused(tmp_path) -> None:

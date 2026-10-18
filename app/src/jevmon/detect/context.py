@@ -309,10 +309,13 @@ class ContextBuilder:
             self._alpha,
         )
         rarity = max(exe_s, edge_s, template_s)
-        recent = self.counts.samples(
-            KIND_RARITY, observation.time - self.settings.rarity_window_seconds
+        since = observation.time - self.settings.rarity_window_seconds
+        rank = getattr(self.counts, "rank", None)  # a counts store may keep the window sorted
+        pct = (
+            rank(KIND_RARITY, since, rarity)
+            if callable(rank)
+            else percentile_rank(self.counts.samples(KIND_RARITY, since), rarity)
         )
-        pct = percentile_rank(recent, rarity)
         first = self.counts.first_time(KIND_EXE, exe)
         age = (observation.time - first) if first is not None else 0.0
         children = self.counts.distinct_prefix(KIND_EDGE, (parent or "<unknown>") + KEY_SEP)
@@ -329,6 +332,7 @@ class ContextBuilder:
         fields: dict[str, Scalar] = {
             "pid": observation.subject,
             "exe": exe,
+            "argv": " ".join(observation.argv),
             "basename": os.path.basename(exe),
             "parent": parent,
             "template": template,

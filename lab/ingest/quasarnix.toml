@@ -1,0 +1,49 @@
+# QuasarNix: every string in X_*_malicious_cmd_* is a synthesized reverse-shell launch; nl2bash.json
+# is benign by intent (human-written one-liners) but not verified safe, so it stays unlabelled.
+
+source = "quasarnix"
+per_family_cap = 30   # rows kept per template family after dedupe (seeded, spread over variants)
+benign_sample = 400   # unlabelled nl2bash rows kept for the false-positive look
+seed = 20
+
+[[rule]]
+id = "malicious-template"
+when = { file = ["malicious"] }
+to = "crit"
+
+[[rule]]
+id = "nl2bash"
+when = { file = ["nl2bash"] }
+to = "null"
+
+# The generator's free parameters, masked in this order to collapse strings to their template
+# family. These are properties of the source's synthesis (address, port, shell, FIFO path, variable
+# name, protocol), kept here as data; they never reach the model or any label.
+[[family_mask]]
+name = "ip"
+pattern = '\b\d{1,3}(?:\.\d{1,3}){3}\b'
+to = "<IP>"
+[[family_mask]]
+name = "shell"
+pattern = '(?<![\w/])(?:/(?:usr/)?(?:s?bin/))?(?:ba|da|z|k|a)?sh(?=socat|[^\w]|$)'
+to = "<SH>"
+[[family_mask]]
+name = "fifo"
+pattern = '(?:/tmp|/home/user|/var/www)/\w+'
+to = "<FIFO>"
+[[family_mask]]
+name = "variable"
+pattern = '\$\w+'
+to = "$<V>"
+[[family_mask]]
+name = "assignment"
+pattern = '^\w+='
+to = "<V>="
+[[family_mask]]
+name = "protocol"
+pattern = '\b(?:tcp|udp)\b'
+to = "<PROTO>"
+[[family_mask]]
+name = "number"
+pattern = '\d+'
+to = "<N>"

@@ -56,6 +56,15 @@ class JudgeSettings:
     # Which judge runs: "laya" is the shipped model, "fake" a deterministic stand-in with no
     # model, no GPU and no judgement (see detect/fake.py) for demos, tests and screenshots.
     mode: str = "laya"
+    # Which shipped judge model answers: "laya" (the local Laya encoder with a frozen linear head,
+    # the default small option), "laya-lora" (the same Laya encoder with the shipped LoRA adapter
+    # merged in at load and its bundled head — no extra dependency, about the frozen encoder's
+    # speed), "ettin" (jhu-clsp/ettin-encoder-1b), "ettin-lora" (the same encoder with the shipped
+    # LoRA adapter merged in) or "qwen3e" (Qwen/Qwen3-Embedding-8B). The
+    # Hugging Face backbones load lazily, only when selected, and need the optional extra
+    # (`uv sync --extra backbone`); a model that cannot load makes the judge unavailable (it
+    # never falls back to Laya). Ignored when `mode = "fake"`.
+    model: str = "laya"
     question: str = "Which of these categories best describes this process launch?"
     # The three classes and what each means (prompt content, generic: no process names or paths).
     # The label the model answers IS the severity (see events.Severity): safe 0, warn 1, crit 2.
@@ -77,7 +86,7 @@ class JudgeSettings:
         }
     )
     # Path to a fine-tuned classification head over the frozen encoder (`.safetensors` written by
-    # `lab/scripts/finetune_head`) or a shipped head's bare name. Empty = the zero-shot model decides.
+    # `lab/scripts/train_heads.py`) or a shipped head's bare name. Empty = the zero-shot model decides.
     # Load-time: the resident head stays until restart, like `device`/`dtype`.
     tuned: str = ""
     # Only for `mode = "fake"` (demos and screenshots): a context containing one of these
@@ -118,6 +127,11 @@ class JudgeSettings:
     def __post_init__(self) -> None:
         if self.mode not in ("laya", "fake"):
             raise ValueError(f"mode must be 'laya' or 'fake', got {self.mode!r}")
+        if self.model not in ("laya", "laya-lora", "ettin", "ettin-lora", "qwen3e"):
+            raise ValueError(
+                "model must be 'laya', 'laya-lora', 'ettin', 'ettin-lora' or 'qwen3e', "
+                f"got {self.model!r}"
+            )
         if self.device not in ("auto", "cpu", "gpu"):
             raise ValueError(f"device must be 'auto', 'cpu' or 'gpu', got {self.device!r}")
         if self.dtype not in ("auto", "fp32", "fp16", "bf16"):
@@ -279,6 +293,11 @@ class Judge:
             self._emit(self._event(context, verdict, reason="dropped: judge queue full"))
             return verdict
         return None
+
+    def record_unjudged(self, context: Context, reason: str, summary: str) -> None:
+        """Emit an unjudged event for a launch that was deliberately not sent to the model."""
+        verdict = Verdict(SAFE, 0.0, Severity.SAFE, False, False, False, summary)
+        self._emit(self._event(context, verdict, reason=reason))
 
     def _run(self) -> None:
         while not self._stop.is_set():

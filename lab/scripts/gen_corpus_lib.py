@@ -22,9 +22,29 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 LABELS = ("safe", "warn", "crit")
+
+# Canonical class descriptions, shared by the generator prompt, the blind local pass and the
+# hosted Jev judge, so all three parties read the classes the same way. The warn definition is
+# operational: the oddness must be a launch shape a reader can see, not a backstory.
+CLASS_DESCRIPTIONS = {
+    "safe": "expected everyday workstation activity: shells, editors, builds, package installs, "
+    "tests, scheduled jobs, ssh sessions and container tooling; nothing unusual in the launch "
+    "itself",
+    "warn": "an unusual launch shape that a reader can see is unusual but not hostile: a script or "
+    "binary from a temp or home directory, a freshly created user bin directory, a debugger, "
+    "profiler or tracer attach, an inline interpreter one-liner, a loop mount, a non-interactive "
+    "admin operation, an unusual parent for the binary; no encoding, no fetch-and-run, no hidden "
+    "or world-writable execution",
+    "crit": "hostile cues visible in the launch itself: downloading and running remote code, an "
+    "encoded or obfuscated inline command, execution from a temporary, hidden or world-writable "
+    "location, an unexpected parent for the binary, a namespace escape, a write to a kernel or "
+    "process-memory interface, credential files as explicit targets, a reverse shell, a "
+    "privilege operation outside a standard context",
+}
 
 # Row schema (one execve-level launch). `facts` is filled in by `synthesize_facts`, not the LLM:
 # the LLM is unreliable at producing well-formed grammar for 9 small enum-like fields, and the
@@ -120,6 +140,138 @@ class LLMClient:
                 time.sleep(delay)
                 delay = min(delay * 2, 60.0)
         raise RuntimeError(f"LLM call failed after {self.max_retries} attempts: {last_err}")
+
+
+# --------------------------------------------------------------------------------- OpenRouter
+
+
+OR_KEY_FILE = "/run/user/1000/secrets/openrouter-api-key"
+OR_DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
+OR_PROVIDER_ORDER = ("digitalocean",)  # pinned: the owner's pick; never fall back to another
+
+
+def or_key() -> str:
+    """OpenRouter key from the environment or the secrets file. Never printed, never logged."""
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not key:
+        key = Path(OR_KEY_FILE).read_text().strip()
+    if not key:
+        raise RuntimeError(f"no OpenRouter key (set OPENROUTER_API_KEY or write {OR_KEY_FILE})")
+    return key
+
+
+def looks_like_refusal(text: str) -> bool:
+    """Cheap refusal heuristic: non-empty prose that talks back instead of answering in JSON."""
+    if not text or not text.strip():
+        return False
+    t = text.lower()
+    pats = (
+        "cannot",
+        "can't",
+        "unable to",
+        "as an ai",
+        "as a language model",
+        "i apologize",
+        "i'm sorry",
+        "i am sorry",
+        "not sure i can",
+        "i do not have",
+    )
+    return any(p in t for p in pats)
+
+
+class OpenRouterError(RuntimeError):
+    """A transport- or provider-level failure of one OpenRouter call."""
+
+
+@dataclass
+class OpenRouterClient:
+    """OpenAI-compatible chat completions through OpenRouter, pinned to one provider.
+
+    The key is read once (environment or the secrets file) and never appears in a message.
+    Provider is pinned (`order` + `allow_fallbacks: false`): a provider-unavailable error is
+    retried with backoff, never by switching provider. A length-truncated or empty reply is
+    retried once with a larger max_tokens. Every call returns `(text, telemetry)` with
+    finish_reason, empty/refusal flags, prompt/completion token counts and the serving provider.
+    """
+
+    base_url: str = "https://openrouter.ai/api/v1/chat/completions"
+    model: str = OR_DEFAULT_MODEL
+    timeout: float = 600.0
+    max_provider_retries: int = 3
+    key: str = field(default_factory=or_key)
+
+    def chat(
+        self,
+        model: str,
+        prompt: str,
+        *,
+        system: str | None = None,
+        temperature: float = 0.9,
+        max_tokens: int = 16000,
+    ) -> tuple[str, dict]:
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        body = {
+            "model": model or self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "provider": {"order": list(OR_PROVIDER_ORDER), "allow_fallbacks": False},
+        }
+        used = max_tokens
+        provider_retries = 0
+        length_retried = False
+        while True:
+            resp = self._post({**body, "max_tokens": used})
+            choice = (resp.get("choices") or [{}])[0]
+            content = (choice.get("message") or {}).get("content") or ""
+            finish = choice.get("finish_reason")
+            usage = resp.get("usage") or {}
+            empty = not content.strip()
+            if (finish == "length" or empty) and not length_retried:
+                length_retried = True
+                used = min(used * 2, 48000)
+                continue
+            telemetry = {
+                "finish_reason": finish,
+                "empty": empty,
+                "refusal": looks_like_refusal(content),
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "provider": resp.get("provider", ""),
+                "provider_retries": provider_retries,
+                "length_retry": length_retried,
+                "max_tokens": used,
+            }
+            return content, telemetry
+
+    def _post(self, body: dict) -> dict:
+        import urllib.error
+
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(
+            self.base_url,
+            data=data,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.key}"},
+        )
+        last: Exception | None = None
+        for attempt in range(self.max_provider_retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    return json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                snippet = e.read()[:200].decode("utf-8", "replace").replace("\n", " ")
+                if e.code in (400, 401, 403):  # bad request or bad key: retrying will not help
+                    raise OpenRouterError(f"HTTP {e.code}: {snippet}") from e
+                last = OpenRouterError(f"HTTP {e.code}: {snippet}")
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                last = OpenRouterError(str(e))
+            if attempt < self.max_provider_retries:
+                time.sleep(2.0 * (attempt + 1))
+        assert last is not None
+        raise last
 
 
 def extract_json(text: str) -> object:
@@ -231,19 +383,25 @@ def validate_taxonomy(families: list[Family]) -> list[str]:
 
 
 GEN_SYSTEM = (
-    "You are generating a SYNTHETIC, TEXT-ONLY dataset for a defensive security classifier. "
+    "You are generating a SYNTHETIC, TEXT-ONLY dataset for a defensive security classifier that "
+    "judges ONE execve-level process launch on a Linux workstation. "
     "You never produce working malware, exploit code, shellcode, long script bodies or real "
-    "secrets - only short process-launch SHAPES (one process's exe, argv, parent, cwd, uid). "
-    "Use RFC 5737 addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) or example.com / "
-    ".invalid hostnames, and obviously-fake credentials. Output strict JSON only, no prose."
+    "secrets - only short process-launch SHAPES (one process's exe, argv, parent, cwd, uid), "
+    "text that is never executed anywhere. Use RFC 5737 addresses (192.0.2.0/24, "
+    "198.51.100.0/24, 203.0.113.0/24) or example.com / .invalid hostnames, and obviously-fake "
+    "credentials. Output strict JSON only, no prose."
 )
 
 
 def build_prompt(family: Family, n: int) -> str:
     return (
         f"Family: {family.name}\n"
-        f"Intended class: {family.label} ({_class_sentence(family.label)})\n"
-        f"Brief: {family.brief}\n\n"
+        f"Intended class: {family.label}\n"
+        f"Brief (the launch shape to generate): {family.brief}\n\n"
+        "The class must be readable from the launch text alone. A reader who sees only the exe "
+        "path, argv, parent, cwd, uid and tty - and nothing else, no history, no later behaviour - "
+        f"must be able to tell the class from cues IN THAT TEXT. {CLASS_DESCRIPTIONS[family.label]}.\n"
+        f"{_class_cues(family.label)}\n"
         f"Generate {n} varied, single-process-launch examples of this family as a JSON array. "
         "Each element is an object with exactly these keys:\n"
         '  "exe": absolute path of the executed binary\n'
@@ -255,27 +413,56 @@ def build_prompt(family: Family, n: int) -> str:
         '  "tty": "yes" or "no" (whether a real terminal is attached)\n'
         '  "env_note": one short phrase of environment color (e.g. "fresh install", '
         '"inside container"), or "" if nothing notable\n\n'
-        "Vary exe choice, argv shape, parent process, cwd and uid across the examples - these "
-        "must not be near-duplicates of each other. This is ONE launch each: a shell pipeline "
-        "stage, not a whole script; if the shape is `sh -c '...'`, the argv is that literal "
-        "string, not a description of what it does. Output a JSON array of exactly "
+        "Everyday realism: these launches happen on an agent workstation - git, cargo, rustc, "
+        "pytest, npm, node, podman, docker, ssh, editors, make and other build tools with "
+        "realistic paths, flags and arguments. Vary exe choice, argv shape, parent process, cwd "
+        "and uid across the examples - they must not be near-duplicates of each other. This is "
+        "ONE launch each: a shell pipeline stage, not a whole script; if the shape is "
+        "`sh -c '...'`, the argv is that literal string, not a description of what it does. "
+        "Output a JSON array of exactly "
         f"{n} objects, nothing else."
     )
 
 
-def _class_sentence(label: str) -> str:
-    return {
-        "safe": "expected everyday activity, no action needed",
-        "warn": "out of the ordinary but plausibly harmless, worth a glance",
-        "crit": "looks hostile from the launch alone",
-    }[label]
+def _class_cues(label: str) -> str:
+    if label == "safe":
+        return (
+            "Safe cues: nothing unusual in the launch itself - an everyday tool (shell, editor, "
+            "build tool, package manager, test runner, container CLI, ssh) with ordinary "
+            "arguments, ordinary locations (/usr, /bin, a project directory, a venv, a "
+            "language-tool cache) and an ordinary parent (a shell, a build tool, an IDE, a test "
+            "runner, the user session). No temp-directory binaries, no encoded strings, no "
+            "unusual parent, no admin-only operation."
+        )
+    if label == "warn":
+        return (
+            "Warn cues: exactly one kind of visible oddness, nothing hostile. The launch looks "
+            "unusual on its face - a script or binary from /tmp, /var/tmp or a home directory, a "
+            "binary from a freshly created user bin directory, a debugger/profiler/strace attach, "
+            "an inline interpreter one-liner, a loop mount, a non-interactive admin operation, an "
+            "unusual parent for the binary, a first-run shape - but there is NO encoding or "
+            "obfuscation, NO fetch-and-run, NO hidden dotfile directory, NO world-writable exec "
+            "location, NO namespace or kernel-memory touching. A reader sees something worth a "
+            "glance, not something hostile."
+        )
+    return (
+        "Crit cues: at least one hostile cue must appear in the launch text itself - downloading "
+        "and running remote code (curl/wget piped to a shell), an encoded or obfuscated inline "
+        "string being decoded and run, execution from a temporary, hidden or world-writable "
+        "location, an unexpected parent for the binary, a namespace escape (nsenter -t 1), a "
+        "write to /proc/kcore or /proc/[pid]/mem, credential files as explicit targets, a "
+        "reverse shell one-liner, a privilege operation (setpriv --cap-add, aa-disable, "
+        "sysctl -w, systemctl mask) in a non-standard context, a process named like a kernel "
+        "thread, a memfd or /dev/shm executable. The cue must be visible in exe/argv/parent/cwd/"
+        "uid - not in what the process does afterwards."
+    )
 
 
 def propose_families_prompt(n: int, existing: Iterable[str], label: str) -> str:
     existing_list = ", ".join(sorted(existing)[:120]) or "(none yet)"
     return (
         f"Propose {n} NEW behaviour families for a process-launch classifier, all intended "
-        f"class '{label}' ({_class_sentence(label)}).\n"
+        f"class '{label}': {CLASS_DESCRIPTIONS[label]}.\n"
         f"Families already used (do not repeat these or close synonyms): {existing_list}\n\n"
         "Each family is a short, specific *launch shape* (not a vague category). Output a JSON "
         "array of objects with keys:\n"

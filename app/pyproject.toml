@@ -8,7 +8,14 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
   "laya>=0.4.2",
   "safetensors",
+  "tomlkit>=0.15.2",
 ]
+
+# The Hugging Face backbone judges (`[judge] model = "ettin"`/"qwen3e") load the models through
+# transformers; the default install stays light and the import is lazy. Install with
+# `uv sync --extra backbone` before selecting one.
+[project.optional-dependencies]
+backbone = ["transformers>=5"]
 
 [dependency-groups]
 # pillow rasterises the README screenshots (docs/screenshots/*.png) from a tmux capture.
@@ -59,6 +66,11 @@ src = ["src", "tests"]
 # is never needed.
 [tool.ruff.lint]
 extend-select = ["UP", "FA"]
+
+[tool.pytest.ini_options]
+markers = [
+  "slow: needs a GPU and the model in the Hugging Face cache; skipped otherwise",
+]
 
 [project.scripts]
 jevmon = "jevmon.cli:main"

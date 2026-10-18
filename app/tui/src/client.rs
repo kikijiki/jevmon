@@ -28,8 +28,17 @@ const BACKOFF: [u64; 5] = [1, 2, 4, 8, 15];
 /// UI -> daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonCmd {
-    Label { event_id: u64, label: String },
-    Ack { event_id: u64 },
+    Label {
+        event_id: u64,
+        label: String,
+    },
+    Ack {
+        event_id: u64,
+    },
+    /// Append an allow rule to the owner's config (the daemon validates and writes it).
+    AllowAdd {
+        rule: String,
+    },
     Pause,
     Resume,
     Reconnect,
@@ -45,6 +54,12 @@ pub enum DaemonMsg {
     Stats(Stats),
     /// The event payload returned by a `label`/`ack` request.
     Labeled(EventPayload),
+    /// The reply to an `allow_add`: how many rules are active now, and whether it was new.
+    AllowAdded {
+        rule: String,
+        count: u64,
+        changed: bool,
+    },
     /// A request was answered with an error (or could not be sent).
     Failed(String),
     /// The connection is gone; the client will retry after `retry_in` seconds.
@@ -168,11 +183,17 @@ async fn dispatch(
     next_id: &mut u64,
     command: DaemonCmd,
 ) -> Result<DaemonMsg, String> {
+    let mut added_rule = None;
     let (request, is_status) = match command {
         DaemonCmd::Label { event_id, label } => {
             (protocol::label_request(*next_id, event_id, &label), false)
         }
         DaemonCmd::Ack { event_id } => (protocol::ack_request(*next_id, event_id), false),
+        DaemonCmd::AllowAdd { rule } => {
+            let request = protocol::allow_add_request(*next_id, &rule);
+            added_rule = Some(rule);
+            (request, false)
+        }
         DaemonCmd::Pause => (protocol::pause_request(*next_id), true),
         DaemonCmd::Resume => (protocol::resume_request(*next_id), true),
         DaemonCmd::Reconnect => unreachable!("handled by the caller"),
@@ -188,6 +209,23 @@ async fn dispatch(
         let stats: Stats =
             serde_json::from_value(result).map_err(|e| format!("bad status reply: {e}"))?;
         return Ok(DaemonMsg::Stats(stats));
+    }
+    if let Some(rule) = added_rule {
+        #[derive(Deserialize)]
+        struct AllowResult {
+            #[serde(default)]
+            count: u64,
+            #[serde(default)]
+            changed: bool,
+        }
+        return match serde_json::from_value::<AllowResult>(result) {
+            Ok(AllowResult { count, changed }) => Ok(DaemonMsg::AllowAdded {
+                rule,
+                count,
+                changed,
+            }),
+            Err(e) => Ok(DaemonMsg::Failed(format!("bad allow reply: {e}"))),
+        };
     }
     #[derive(Deserialize)]
     struct EventResult {

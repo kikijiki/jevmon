@@ -410,7 +410,7 @@ def test_shipped_head_is_the_default_and_plumbed_from_judge_config():
     from jevmon.monitor import build_decider
 
     assert LayaConfig().tuned == ""
-    assert build_decider(load_config()).config.tuned == "lab-head-v4"
+    assert build_decider(load_config()).config.tuned == "laya"
 
 
 def test_checkpoint_dir_registers_the_fine_tune_on_the_router():

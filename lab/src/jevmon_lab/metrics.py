@@ -57,7 +57,7 @@ def score(rows: list[Row], labels: tuple[str, ...] = LABELS) -> dict:
         tp = sum(1 for t in truth if t == lab and lab == "safe")
         fp = sum(1 for t in truth if t != lab) if lab == "safe" else 0
         fn = support.get(lab, 0) - tp
-        precision, recall, f1 = _prf(tp, fp, fn)
+        _precision, _recall, f1 = _prf(tp, fp, fn)
         base_f1s.append(f1)
     return {
         "n": len(truth),

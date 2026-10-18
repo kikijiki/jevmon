@@ -1,19 +1,19 @@
-"""Wire protocol for the jevmon daemon control socket, version 2.
+"""Wire protocol for the jevmon daemon control socket, version 5.
 
 Newline-delimited JSON over a Unix domain socket. One request per line; a line longer than
 `MAX_LINE` is rejected. Every request carries `type` (required), an optional correlating `id`
-(echoed on the response) and `v` (the protocol version; absent means 3). Unknown request types and
+(echoed on the response) and `v` (the protocol version; absent means the current one). Unknown request types and
 unknown fields are rejected, and every reply is bounded in size.
 
-    request:  {"v":4,"id":7,"type":"status"}
-    response: {"v":4,"id":7,"ok":true,"result":{...}}
-    error:    {"v":4,"id":7,"ok":false,"error":"..."}
+    request:  {"v":5,"id":7,"type":"status"}
+    response: {"v":5,"id":7,"ok":true,"result":{...}}
+    error:    {"v":5,"id":7,"ok":false,"error":"..."}
 
 `subscribe` turns the connection into a one-way stream of new events plus periodic stats:
 
-    {"v":4,"stream":"ready","result":{"subscribed":true}}
-    {"v":4,"stream":"event","event":{...}}
-    {"v":4,"stream":"stats","stats":{...}}
+    {"v":5,"stream":"ready","result":{"subscribed":true}}
+    {"v":5,"stream":"event","event":{...}}
+    {"v":5,"stream":"stats","stats":{...}}
 
 Version 2 (one axis): an event's `severity` is the class (0 safe, 1 warn, 2 crit) and `class`
 is its name; the old `category` and `category_severity` fields are gone. There is no
@@ -28,6 +28,10 @@ Requests:
 - `ack`     {event_id}      -> {event}.
 - `pause` / `resume`        -> status.
 - `reload`                  -> {reloaded, config}.
+- `allow_add`    {rule}     -> {rules, count, hits, changed}: append to `[filter] allow` in the
+                               owner's config file and apply live; a duplicate is a no-op.
+- `allow_remove` {rule}     -> same shape.
+- `allow_list`              -> {rules, count, hits}.
 - `shutdown`                -> {shutdown:true}.
 """
 
@@ -37,13 +41,14 @@ from dataclasses import dataclass
 from jevmon.events import Event
 from jevmon.sanitize import shorten
 
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 MAX_LINE = 131_072  # bytes of one request line
 MAX_REPLY = 8_000_000  # bytes of one reply line the client will read
 MAX_LIMIT = 100  # events returned by one query
 DEFAULT_LIMIT = 50
 MAX_TEXT = 512  # query text filter
 MAX_LABEL = 128  # human label
+MAX_RULE = 1_024  # one allow rule
 MAX_STRING = 4_000  # any string field in a reply
 
 REQUEST_FIELDS: dict[str, frozenset[str]] = {
@@ -55,6 +60,9 @@ REQUEST_FIELDS: dict[str, frozenset[str]] = {
     "pause": frozenset(),
     "resume": frozenset(),
     "reload": frozenset(),
+    "allow_add": frozenset({"rule"}),
+    "allow_remove": frozenset({"rule"}),
+    "allow_list": frozenset(),
     "shutdown": frozenset(),
     "subscribe": frozenset({"since_id"}),
 }
@@ -142,6 +150,11 @@ def _parse_params(kind: str, obj: dict) -> dict[str, object]:
             "event_id": _int(obj.get("event_id"), "event_id", minimum=1),
             "label": _str(obj.get("label"), "label", MAX_LABEL),
         }
+    if kind in {"allow_add", "allow_remove"}:
+        rule = _str(obj.get("rule"), "rule", MAX_RULE).strip()
+        if not rule:
+            raise ProtocolError("rule: empty")
+        return {"rule": rule}
     if kind == "subscribe":
         params = {}
         if "since_id" in obj:
@@ -214,6 +227,8 @@ def event_payload(event_id: int, event: Event, labels: list[str]) -> dict:
         "severity": int(event.severity),
         "message": bounded(event.message),
         "command": bounded(event.command),
+        "exe": bounded(str(fields.get("exe", ""))),
+        "argv": bounded(str(fields.get("argv", ""))),
         "context": bounded(str(fields.get("context", ""))),
         "verdict": bounded(str(fields.get("verdict", ""))),
         "class": bounded(str(fields.get("label", "")), MAX_LABEL),
@@ -234,6 +249,7 @@ __all__ = [
     "MAX_LIMIT",
     "MAX_LINE",
     "MAX_REPLY",
+    "MAX_RULE",
     "MAX_STRING",
     "PROTOCOL_VERSION",
     "ProtocolError",

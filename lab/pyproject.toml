@@ -7,11 +7,22 @@ description = "Process-launch lab, dataset tooling and judge experiments for jev
 requires-python = ">=3.13,<3.14"
 dependencies = [
   "jevmon",
-  "trackio==0.39.0",
+  "pyarrow",
 ]
 
 [project.scripts]
 jevmon-lab = "jevmon_lab.cli:main"
+
+# Optional, never in the default env: `uv run --project lab --extra plots ...` draws the
+# learning-curve figure in lab/scripts/learning_curve.py.
+[project.optional-dependencies]
+plots = ["matplotlib"]
+# LoRA/PEFT check on the Laya encoder (`lab/scripts/lora_check.py`), on the iGPU env:
+# `uv sync --project lab --group gpu --no-group cpu --extra lora`.
+lora = ["peft"]
+# Local experiment tracking (`jevmon_lab.runlog`); the run still writes a JSONL log without it.
+# `uv sync --project lab --extra trackio`; `just runs` serves the dashboard.
+trackio = ["trackio==0.39.0"]
 
 [dependency-groups]
 dev = ["pytest", "ruff"]

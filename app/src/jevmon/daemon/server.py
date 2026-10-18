@@ -253,6 +253,12 @@ class DaemonServer:
             return self.monitor.status()
         if kind == "reload":
             return await asyncio.to_thread(self.monitor.reload)
+        if kind == "allow_add":
+            return await asyncio.to_thread(self.monitor.allow_add, request.params["rule"])
+        if kind == "allow_remove":
+            return await asyncio.to_thread(self.monitor.allow_remove, request.params["rule"])
+        if kind == "allow_list":
+            return await asyncio.to_thread(self.monitor.allow_list)
         if kind == "shutdown":
             return {"shutdown": True}
         raise protocol.ProtocolError(f"unhandled request {kind!r}")

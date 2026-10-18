@@ -176,9 +176,9 @@ def test_config_selects_the_replay_source_and_the_fake_judge(tmp_path):
         load_config(write_config(tmp_path, '[judge]\nmode = "oracle"\n'))
 
 
-def test_the_shipped_defaults_still_select_the_proc_source_and_laya():
+def test_the_shipped_defaults_select_the_ebpf_source_and_laya():
     cfg = load_config()
-    assert cfg.exec.source == "proc" and cfg.judge.mode == "laya"
+    assert cfg.exec.source == "ebpf" and cfg.judge.mode == "laya"
     assert not isinstance(build_source(cfg.exec, emit=lambda event: None), ReplaySource)
     assert not isinstance(build_decider(cfg), FakeDecider)
 

@@ -1,0 +1,47 @@
+# Label mapping for yannelli/cli-command-risk (machine-generated risk_level + risk_categories).
+# The source label is the worst plausible outcome if the user runs the command as meant, not
+# "looks hostile": categories describing self-inflicted damage are dropped, not mapped.
+# First matching rule wins.
+
+source = "cli-command-risk"
+family_fields = ["derived_from", "provenance"]  # first non-empty is the family
+
+[[rule]]
+id = "safe"
+when = { risk_level = ["safe"] }
+to = "safe"
+
+[[rule]]
+id = "fetch-and-run"
+when = { risk_categories_any = ["unsafe_download_exec", "remote_code_execution"] }
+to = "crit"
+
+[[rule]]
+id = "privesc-history"
+when = { risk_categories_any = ["privilege_escalation", "history_log_tampering"], risk_level = ["high", "critical"] }
+to = "crit"
+uncertain = "privilege_escalation / history tampering label may describe a footgun, not an attack"
+
+[[rule]]
+id = "credential-exposure"
+when = { risk_categories_any = ["credential_exposure"], risk_level = ["high", "critical"] }
+to = "warn"
+uncertain = "credential_exposure is a harm label (secret on a command line), not hostility"
+
+[[rule]]
+id = "self-inflicted"
+when = { risk_categories_any = [
+  "data_destruction", "device_overwrite", "overbroad_permissions", "shell_footgun", "signal_kill",
+  "irreversible_config", "network_disruption", "resource_exhaustion",
+] }
+to = "drop"
+
+[[rule]]
+id = "low-moderate"
+when = { risk_level = ["low", "moderate"] }
+to = "null"
+
+[[rule]]
+id = "rest"
+when = {}
+to = "drop"

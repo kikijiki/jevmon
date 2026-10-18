@@ -9,7 +9,7 @@ from jevmon.events import Event
 
 
 def test_valid_requests_parse():
-    req = protocol.parse_request({"v": 4, "id": 3, "type": "events", "limit": 5, "unlabeled": True})
+    req = protocol.parse_request({"v": 5, "id": 3, "type": "events", "limit": 5, "unlabeled": True})
     assert req.kind == "events" and req.req_id == 3
     assert req.params == {"limit": 5, "unlabeled": True}
 

@@ -66,9 +66,79 @@ def build_parser() -> argparse.ArgumentParser:
     ack_ctl.add_argument("event_id", type=int)
     ctl_sub.add_parser("pause", help="pause judging, keep the poller and census running")
     ctl_sub.add_parser("resume", help="resume judging")
+    allow_ctl = ctl_sub.add_parser("allow", help="show or edit the [filter] allow rules")
+    allow_sub = allow_ctl.add_subparsers(dest="allow_command", required=True)
+    allow_sub.add_parser("list", help="the active rules and their hit counts")
+    allow_add = allow_sub.add_parser("add", help="append a rule to the config file, live")
+    allow_add.add_argument("rule", help='e.g. "/usr/bin/git rev-parse *"')
+    allow_rm = allow_sub.add_parser("remove", help="remove a rule from the config file, live")
+    allow_rm.add_argument("rule")
     ctl_sub.add_parser("shutdown", help="ask the daemon to stop")
 
+    for name, text in (
+        ("start", "start the daemon; for source = ebpf also the root helper (one prompt)"),
+        ("stop", "stop the daemon, and the helper if `jevmon start` started it"),
+        ("status", "show the configured source, the helper and the daemon (no privileges)"),
+    ):
+        service_p = sub.add_parser(name, help=text)
+        service_p.add_argument("--config", help="path to a config.toml (default: XDG config)")
+
+    helper_p = sub.add_parser("helper", help="advanced: start/stop only the root helper")
+    helper_p.add_argument("action", choices=("start", "stop"))
+    helper_p.add_argument("--config", help="path to a config.toml (default: XDG config)")
+
     return parser
+
+
+def _run_service(args: argparse.Namespace, config: Config) -> int:
+    import os
+
+    from jevmon import service
+
+    try:
+        if args.command == "status":
+            for line in service.status_lines(config, _daemon_status()):
+                sys.stdout.write(line + "\n")
+            return 0
+        if args.command == "stop" or (args.command == "helper" and args.action == "stop"):
+            kind, active = service.unit_state()
+            plan = service.plan_stop(unit_kind=kind, unit_active=active)
+            if args.command == "helper":
+                plan.steps = [step for step in plan.steps if step.elevated]
+            return service.execute(plan)
+        answering = service.probe_socket(config.exec.helper_socket)
+        plan = service.plan_start(
+            replace(config, exec=replace(config.exec, source="ebpf"))
+            if args.command == "helper"
+            else config,
+            helper_answering=answering,
+            uid=os.getuid(),
+            helper_finder=lambda cfg: service.find_helper(cfg, service.repo_root()),
+        )
+        if args.command == "helper":
+            plan.steps = [step for step in plan.steps if step.elevated]
+        socket_path = config.exec.helper_socket
+        return service.execute(
+            plan, after={"start helper": lambda: service.wait_for_helper(socket_path)}
+        )
+    except service.ServiceError as exc:
+        sys.stderr.write(f"jevmon: {exc}\n")
+        return 1
+
+
+def _daemon_status() -> dict | None:
+    import asyncio
+
+    from jevmon.daemon.client import DaemonClient
+
+    async def ask() -> dict:
+        async with DaemonClient() as client:
+            return await client.status()
+
+    try:
+        return asyncio.run(ask())
+    except Exception:  # noqa: BLE001 - no daemon, a stale socket: status says "not running"
+        return None
 
 
 def _settings(config: Config, proc_root: str | None) -> ExecSettings:
@@ -122,7 +192,7 @@ def _run_loop(
         monitor = Monitor(
             config,
             store,
-            proc_root=settings.proc_root,
+            proc_root=settings.proc_root if settings.proc_root != config.exec.proc_root else None,
             summary_stream=sys.stdout,
             verbose=verbose,
         )
@@ -168,6 +238,8 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         sys.stderr.write(f"jevmon: {exc}\n")
         return 2
+    if args.command in {"start", "stop", "status", "helper"}:
+        return _run_service(args, config)
     if args.command in {"label", "ack"}:
         return _run_label(args, config)
     if args.command != "exec":

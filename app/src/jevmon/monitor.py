@@ -15,26 +15,45 @@ from collections.abc import Callable
 from dataclasses import replace
 from typing import TextIO
 
-from jevmon.config import Config, load_config
-from jevmon.core import EVENT_KIND_EXEC, MemoryCounts, Pipeline, SqliteStore, StoreSink
+from jevmon.allow import AllowList, args_of
+from jevmon.config import Config, edit_allow, load_config
+from jevmon.core import (
+    EVENT_KIND_EXEC,
+    BufferedCounts,
+    Counts,
+    MemoryCounts,
+    Pipeline,
+    SqliteStore,
+    StoreSink,
+)
 from jevmon.detect.context import ContextBuilder, EnvironmentStats, ExecObservation
 from jevmon.detect.fake import FakeDecider
 from jevmon.detect.judge import SAFE, Decider, Judge
 from jevmon.detect.stats import ForkRateBaseline
 from jevmon.detect.system_facts import RealSystemFacts
 from jevmon.events import Event, JsonlSink, MinSeveritySink, Severity, Sink
+from jevmon.laya.backbone import BackboneConfig, BackboneDecider
 from jevmon.laya.decider import LayaConfig, LayaDecider
+from jevmon.laya.head import DEFAULT_HEAD, DEFAULT_LORA_HEAD
+from jevmon.sources.ebpf import EbpfSource
 from jevmon.sources.exec import KIND_SUMMARY, ExecSettings, ExecSource
 from jevmon.sources.proc import RealProcReader
 from jevmon.sources.replay import ReplaySource
 
 
-def build_decider(config: Config) -> Decider:
-    """Construct the judge from `[judge]`: the offline Laya decider, or the fake stand-in."""
-    j = config.judge
-    if j.mode == "fake":
-        return FakeDecider(j)
-    laya = LayaConfig(
+def laya_config(j) -> LayaConfig:
+    """The Laya decider's config from `[judge]`.
+
+    `model = "laya"` uses the packaged linear head (`tuned` empty); `model = "laya-lora"` merges
+    the packaged LoRA adapter into the encoder and adopts its bundled head, with `tuned` (if set)
+    only replacing that classifier. `backbone_config` handles the HF backbones.
+    """
+    lora = ""
+    tuned = j.tuned or DEFAULT_HEAD
+    if j.model == "laya-lora":
+        lora = DEFAULT_LORA_HEAD
+        tuned = j.tuned  # empty = the adapter's bundled head
+    return LayaConfig(
         categories=dict(j.categories),
         routine=SAFE,
         attention_question=j.question,
@@ -44,19 +63,52 @@ def build_decider(config: Config) -> Decider:
         threads_gpu=j.threads_gpu,
         device=j.device,
         dtype=j.dtype,
-        tuned=j.tuned,
+        tuned=tuned,
+        lora=lora,
         checkpoint=j.checkpoint,
         checkpoint_dir=j.checkpoint_dir,
     )
-    return LayaDecider(laya)
+
+
+def backbone_config(j) -> BackboneConfig:
+    """The Hugging Face backbone decider's config from `[judge]`; `tuned` empty = packaged head
+    (for `ettin-lora`, the adapter's bundled classifier)."""
+    return BackboneConfig(
+        key=j.model,
+        categories=dict(j.categories),
+        routine=SAFE,
+        head=j.tuned or ("" if j.model.endswith("-lora") else j.model),
+        device=j.device,
+        dtype=j.dtype,
+        threads=j.threads,
+        threads_gpu=j.threads_gpu,
+    )
+
+
+def decider_settings(j):
+    """The decider-specific settings for `[judge]` (LayaConfig or BackboneConfig)."""
+    return laya_config(j) if j.model in ("laya", "laya-lora") else backbone_config(j)
+
+
+def build_decider(config: Config) -> Decider:
+    """Construct the judge from `[judge]`: the fake stand-in, Laya, or an HF backbone judge."""
+    j = config.judge
+    if j.mode == "fake":
+        return FakeDecider(j)
+    if j.model in ("laya", "laya-lora"):
+        return LayaDecider(laya_config(j))
+    return BackboneDecider(backbone_config(j))
 
 
 def build_source(
     settings: ExecSettings, emit: Callable[[Event], None]
-) -> ExecSource | ReplaySource:
-    """Construct the event source from `[exec] source`: the `/proc` poller or a replay."""
+) -> ExecSource | ReplaySource | EbpfSource:
+    """Construct the event source from `[exec] source`: the helper stream, the `/proc` poller or
+    a replay."""
     if settings.source == "replay":
         return ReplaySource(settings, emit=emit)
+    if settings.source == "ebpf":
+        return EbpfSource(settings, emit=emit)
     return ExecSource(RealProcReader(settings.proc_root), settings, emit=emit)
 
 
@@ -81,14 +133,18 @@ class Monitor:
         self._decider = decider
         self._summary_stream = summary_stream
         self._verbose = verbose
-        self.settings: ExecSettings = (
-            replace(config.exec, proc_root=proc_root) if proc_root else config.exec
-        )
+        self.settings: ExecSettings = config.exec
+        if proc_root:  # an alternate /proc tree (tests, --proc-root) means the poller
+            self.settings = replace(config.exec, proc_root=proc_root, source="proc")
         self.pipeline: Pipeline | None = None
         self.builder: ContextBuilder | None = None
         self.decider: Decider | None = None
         self.judge: Judge | None = None
-        self.source: ExecSource | ReplaySource | None = None
+        self.store_sink: StoreSink | None = None
+        self.buffered_counts: BufferedCounts | None = None
+        self.source: ExecSource | ReplaySource | EbpfSource | None = None
+        self.allow = AllowList.from_strings(config.filter.allow)
+        self._allow_lock = threading.Lock()
         self.env = EnvironmentStats()
         self.fork_baseline = ForkRateBaseline()
         self.started_at: float | None = None
@@ -110,11 +166,26 @@ class Monitor:
             threshold = Severity.SAFE if self._verbose else Severity.CRIT
             sinks.append(MinSeveritySink(JsonlSink(stream=self._summary_stream), threshold))
         if self.store is not None:
-            sinks.append(StoreSink(self.store, cfg.store.store_exec_events))
+            ebpf = self.settings.source == "ebpf"
+            self.store_sink = StoreSink(
+                self.store,
+                cfg.store.store_exec_events,
+                repeat_seconds=cfg.store.coalesce_seconds if ebpf else 0.0,
+            )
+            sinks.append(self.store_sink)
         self.pipeline = Pipeline(sinks, capacity=cfg.store.queue_capacity)
         self.pipeline.start()
 
-        counts = self.store if self.store is not None else MemoryCounts()
+        counts: Counts
+        if self.store is None:
+            counts = MemoryCounts()
+        elif self.settings.source == "ebpf":
+            # hundreds of execs a second: counts are kept in memory and written in batches
+            self.buffered_counts = BufferedCounts(self.store)
+            self.buffered_counts.start()
+            counts = self.buffered_counts
+        else:
+            counts = self.store
         self.builder = ContextBuilder(counts, RealSystemFacts(), cfg.context)
         self.decider = self._decider if self._decider is not None else build_decider(cfg)
         self.judge = Judge(self.decider, cfg.judge, emit=self.pipeline.submit)
@@ -150,6 +221,8 @@ class Monitor:
         finally:
             self.judge.stop()
             self.pipeline.stop()
+            if self.buffered_counts is not None:
+                self.buffered_counts.close()
 
     # -- control --------------------------------------------------------------------------
 
@@ -166,6 +239,9 @@ class Monitor:
     def reload(self) -> dict:
         new = load_config(self.config_path)
         self.config = new
+        with self._allow_lock:
+            if tuple(r.text for r in self.allow.rules) != new.filter.allow:
+                self.allow = self.allow.replaced(new.filter.allow)
         if self.source is not None and self._proc_root is None:
             self.source.apply_settings(new.exec)
         if self.builder is not None:
@@ -175,29 +251,46 @@ class Monitor:
         if self.decider is not None:
             reconfigure = getattr(self.decider, "reconfigure", None)
             if callable(reconfigure):
-                j = new.judge
-                reconfigure(
-                    LayaConfig(
-                        categories=dict(j.categories),
-                        routine=SAFE,
-                        attention_question=j.question,
-                        attack_min=1.0,
-                        offline=True,
-                        threads=j.threads,
-                        threads_gpu=j.threads_gpu,
-                        device=j.device,
-                        dtype=j.dtype,
-                        tuned=j.tuned,
-                        checkpoint=j.checkpoint,
-                        checkpoint_dir=j.checkpoint_dir,
-                    )
-                )
+                reconfigure(decider_settings(new.judge))
         return {"reloaded": True, "config": str(self.config_path or "")}
+
+    # -- allow list -----------------------------------------------------------------------
+
+    def allow_list(self) -> dict:
+        with self._allow_lock:
+            return self._allow_view()
+
+    def allow_add(self, rule: str) -> dict:
+        """Append `rule` to the config file's `[filter] allow` and apply it live."""
+        return self._allow_edit(add=rule)
+
+    def allow_remove(self, rule: str) -> dict:
+        return self._allow_edit(remove=rule)
+
+    def _allow_edit(self, *, add: str | None = None, remove: str | None = None) -> dict:
+        with self._allow_lock:
+            rules, changed = edit_allow(self.config_path, add=add, remove=remove)
+            if tuple(r.text for r in self.allow.rules) != tuple(rules):
+                self.allow = self.allow.replaced(rules)
+            self.config = replace(
+                self.config, filter=replace(self.config.filter, allow=tuple(rules))
+            )
+            return {**self._allow_view(), "changed": changed}
+
+    def _allow_view(self) -> dict:
+        return {
+            "rules": [rule.text for rule in self.allow.rules],
+            "count": len(self.allow.rules),
+            "hits": self.allow.hit_counts(),
+        }
 
     def status(self) -> dict:
         source = self.source
         judge = self.judge
+        extra = getattr(source, "status", None)
         return {
+            "exec_source": self.settings.source,
+            **(extra() if callable(extra) else {}),
             "uptime": round(time.time() - self.started_at, 1) if self.started_at else 0.0,
             "model_status": self._model_status(),
             "judge_device": self._judge_state("active_device"),
@@ -207,6 +300,7 @@ class Monitor:
             "observed": source.observed_total if source else 0,
             "estimated_missed": source.missed_total if source else 0,
             "tracked": source.tracked if source else 0,
+            "coalesced": self.store_sink.coalesced if self.store_sink else 0,
             "judged": judge.judged if judge else 0,
             "cached": judge.cached if judge else 0,
             "dropped": judge.dropped if judge else 0,
@@ -215,6 +309,9 @@ class Monitor:
             "queue_age": round(judge.oldest_age, 1) if judge else 0.0,
             "avg_batch": round(judge.avg_batch, 2) if judge else 0.0,
             "ms_per_context": round(judge.ms_per_context, 1) if judge else 0.0,
+            "allow_rules": len(self.allow.rules),
+            "allow_skipped": self.allow.skipped,
+            "allow_hits": self.allow.hit_counts(),
             "paused": self.paused,
             "store": self.store.path if self.store is not None else "",
             "config": str(self.config_path or ""),
@@ -245,6 +342,17 @@ class Monitor:
                 self.pipeline.submit(event)
             return
         if event.kind == EVENT_KIND_EXEC:
+            with self._allow_lock:
+                allow = self.allow
+                rule = allow.check(
+                    str(event.fields.get("exe", "")), args_of(str(event.fields.get("argv", "")))
+                )
+                rule_text = allow.rules[rule].text if rule is not None else ""
+            if rule is not None:
+                if self.config.filter.store_skipped:
+                    context = self.builder.observe_exec(ExecObservation.from_event(event), self.env)
+                    self.judge.record_unjudged(context, "allow", f"allow rule: {rule_text}")
+                return
             if (
                 self.pipeline is not None
                 and self.store is not None

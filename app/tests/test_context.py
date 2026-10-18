@@ -89,7 +89,7 @@ def test_renaming_binary_changes_only_the_text():
     b1, b2 = builder(), builder()
     c1 = b1.observe_exec(obs("/opt/alpha", ["/opt/alpha", "--x"]), EnvironmentStats())
     c2 = b2.observe_exec(obs("/opt/beta", ["/opt/beta", "--x"]), EnvironmentStats())
-    ignore = {"exe", "basename", "parent_template"}
+    ignore = {"exe", "argv", "basename", "parent_template"}
     assert {k: v for k, v in c1.fields.items() if k not in ignore} == {
         k: v for k, v in c2.fields.items() if k not in ignore
     }

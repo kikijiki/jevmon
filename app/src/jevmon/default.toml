@@ -8,10 +8,25 @@
 # only tunes the poller, the context text and the model's question/calibration.
 
 [exec]
-# Event source. "proc" polls a /proc tree (the shipped default); "replay" re-emits a recorded
+# Event source. "ebpf" (the default) reads every exec from the privileged jevmon-exec helper over
+# a unix socket (`jevmon start` starts it; needs root once per start). "proc" polls a /proc tree
+# and needs no privileges, but sees only a share of short launches. "replay" re-emits a recorded
 # JSON-lines stream from `replay_file`, one event per `interval` seconds - a deterministic
 # stand-in for demos, tests and screenshots, with no real processes involved.
-source = "proc"
+# There is no automatic fallback between sources: with "ebpf" and no helper the daemon reports it.
+source = "ebpf"
+# ebpf only (ignored by the other sources): the helper's socket, the reconnect backoff bounds in
+# seconds, and how many recent execs are remembered to name a launch's parent.
+helper_socket = "/run/jevmon/exec.sock"
+helper_retry_min = 0.5
+helper_retry_max = 10.0
+recent_exec_max = 4096
+# CPU ceiling of the ebpf reader, as a fraction of one core. Above it the source stops reading and
+# the helper counts the events it could not deliver (`exec_client_dropped`). 0 = no ceiling.
+helper_cpu_budget = 0.5
+# Helper binary for `jevmon start`; empty = `jevmon-exec` on PATH, else the build in app/helper/result.
+helper_path = ""
+# The recording replayed when source = "replay".
 replay_file = ""
 # Also read each parent's command line (one extra /proc read per exec) for the `parent_cmd`
 # context segment. Off: that segment did not help the judge.
@@ -66,18 +81,38 @@ argv_max = 300
 # model, no GPU and no judgement - a stable hash of the context over the classes below, with
 # verdict summaries prefixed `mock:`. For demos, tests and screenshot runs.
 mode = "laya"
+# Which shipped judge model answers the question. Each is a classifier over a Laya or Hugging
+# Face encoder, fitted on the mixed train pool, so they share the judge pipeline and differ only
+# in the backbone and its cost:
+#   "laya"      - the local Laya encoder with a frozen linear head, the default. Small; about
+#                 42-44 ms/context on this box's iGPU. Recommended for ordinary machines.
+#   "laya-lora" - the same Laya encoder with a small LoRA adapter merged into the weights at load
+#                 (no extra dependency, no extra model download). The adapter is about 27 MiB and
+#                 runs at about the frozen encoder's speed; see the READMEs for what it scores.
+#   "ettin"     - jhu-clsp/ettin-encoder-1b. Downloads from Hugging Face on first use; needs the
+#                 optional extra (`uv sync --extra backbone`). Not measured on the iGPU.
+#   "ettin-lora" - the Ettin encoder with a small LoRA adapter merged into the weights at load.
+#                 Same download and extra as "ettin"; the adapter is about 22 MiB.
+#   "qwen3e"    - Qwen/Qwen3-Embedding-8B, a decoder. Downloads from Hugging Face on first use;
+#                 needs the optional extra. An 8B encoder, so expect it to need a GPU with spare
+#                 memory (it was not measured on this box).
+# A selected backbone that cannot load is reported in `ctl status` and the judge reports itself
+# unavailable; it never falls back to Laya. Ignored when `mode = "fake"`.
+model = "laya"
 # Prompt content for the model's choice question.
 question = "Which of these categories best describes this process launch?"
-# Fine-tuned classification head over the frozen encoder: a .safetensors file written by
-# lab/scripts/train_head_v3 / finetune_head. A bare name ("lab-head-v4") is a head shipped in
-# the package (src/jevmon/laya/heads/); anything with a directory or suffix is a file path.
-# Empty = the zero-shot model decides. A broken path degrades to zero-shot and says so in
-# `ctl status`.
-tuned = "lab-head-v4"
-# Checkpoint the judge answers from: a built-in name ("english", "multilingual",
-# "typed-decisions") or a local fine-tune registered through checkpoint_dir below.
+# Optional custom classification head, overriding the packaged head for the selected `model`: a
+# .safetensors file (path) or a shipped head's bare name. The packaged heads are `laya`, `ettin`
+# and `qwen3e` (in src/jevmon/laya/heads/) fitted by `lab/scripts/train_heads.py export`; with
+# `model = "laya-lora"` a `tuned` head replaces the adapter's bundled classifier over the merged
+# features. Empty = the packaged/default head for `model`. A broken custom path makes the judge
+# unavailable (a broken Laya head still degrades to zero-shot) and `ctl status` says why.
+tuned = ""
+# Checkpoint the Laya model answers from (only with `model = "laya"` or `"laya-lora"`): a built-in
+# name ("english", "multilingual", "typed-decisions") or a local fine-tune registered through
+# checkpoint_dir below. Used only for the zero-shot fallback when a Laya head fails to load.
 checkpoint = "english"
-# Local directory of a fine-tune (a laya-train output, e.g. models/lab-ft), registered as
+# Local directory of a fine-tune (a `laya-train` output), registered as
 # `checkpoint`. Empty = the built-in source. A path that will not register falls back to the
 # built-in english checkpoint and says so in `ctl status`.
 checkpoint_dir = ""
@@ -126,3 +161,38 @@ retention_days = 14
 queue_capacity = 10000
 # Persist exec events (verdict events are always persisted when a store is configured).
 store_exec_events = false
+# ebpf source: a verdict reused from the memo for a situation already stored in the last this many
+# seconds is counted (`coalesced` in `ctl status`) instead of stored again; the next stored row of
+# that situation carries `repeats`. 0 = store every one. The proc source always stores every verdict.
+coalesce_seconds = 60.0
+
+[filter]
+# Allow rules: launches matching a rule are not judged; everything else is. The list is empty
+# here and the code has no rules of its own. Some processes run hundreds of times a minute on a
+# busy agent workstation and fill the judge queue; an owner may decide to allow the ones they
+# know are routine, for example:
+#   - read-only git queries (rev-parse, config, diff, status, log);
+#   - compilers and linkers (clang, gcc, rustc, ld, lld);
+#   - build caches and build tools (kache, ccache, sccache, make and ninja helpers);
+#   - hardware and status pollers (rocm-smi, nvidia-smi, sensors).
+# Setting `allow` here replaces this list; a list in your own config replaces it as a whole.
+#
+# A rule is "<exe> <args>":
+#   - exe starting with "/" or "*" is a glob over the full exe path (a renamed binary elsewhere
+#     does not match); anything else is a glob over the exe basename, which a binary of that name
+#     in any directory matches, so a bare name can be spoofed. Prefer absolute paths;
+#   - args is a glob over argv[1:] joined with spaces; "*" is the only wildcard and matches any
+#     run of characters, spaces included;
+#   - an exe with no args matches that exe with no arguments; "git diff *" matches "git diff" and
+#     "git diff HEAD" but not "git diffx"; "git diff:*" means the same as "git diff *".
+# Children of an allowed process (hooks, aliases, ssh commands) are separate launches and are
+# still judged.
+#
+# Examples:
+#   "/usr/bin/git rev-parse *"
+#   "/usr/bin/git config --get *"
+#   "/usr/bin/nvidia-smi *"
+allow = []
+# Store allowed launches as unjudged events (reason "allow") so they appear in the list.
+# Off: they are only counted (`allow_skipped` and `allow_hits` in `ctl status`).
+store_skipped = false

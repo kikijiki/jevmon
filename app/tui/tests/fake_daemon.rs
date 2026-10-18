@@ -74,18 +74,18 @@ async fn fake_daemon(path: PathBuf, seen: Arc<Mutex<Vec<Value>>>) {
                 let id = request["id"].clone();
                 let kind = request["type"].as_str().unwrap_or_default().to_string();
                 let reply = match kind.as_str() {
-                    "events" => json!({"v":4,"id":id,"ok":true,"result":{
+                    "events" => json!({"v":5,"id":id,"ok":true,"result":{
                         "events":[event_payload(10), event_payload(11)],
                         "count":2,"more":false}}),
                     "label" => {
                         let event_id = request["event_id"].as_u64().unwrap_or(0);
                         if event_id == 999 {
-                            json!({"v":4,"id":id,"ok":false,"error":"no event 999"})
+                            json!({"v":5,"id":id,"ok":false,"error":"no event 999"})
                         } else {
                             let mut event = event_payload(event_id);
                             event["label"] = request["label"].clone();
                             event["labels"] = json!([request["label"]]);
-                            json!({"v":4,"id":id,"ok":true,"result":{"event":event}})
+                            json!({"v":5,"id":id,"ok":true,"result":{"event":event}})
                         }
                     }
                     "ack" => {
@@ -93,25 +93,33 @@ async fn fake_daemon(path: PathBuf, seen: Arc<Mutex<Vec<Value>>>) {
                         event["label"] = json!("true-positive");
                         event["labels"] = json!(["true-positive", "ack"]);
                         event["acked"] = json!(true);
-                        json!({"v":4,"id":id,"ok":true,"result":{"event":event}})
+                        json!({"v":5,"id":id,"ok":true,"result":{"event":event}})
+                    }
+                    "allow_add" => {
+                        if request["rule"] == "*" {
+                            json!({"v":5,"id":id,"ok":false,"error":"RuleError: would match every launch"})
+                        } else {
+                            json!({"v":5,"id":id,"ok":true,"result":{
+                                "rules":[request["rule"]],"count":1,"hits":{},"changed":true}})
+                        }
                     }
                     "status" | "pause" | "resume" => json!({
-                        "v":4,"id":id,"ok":true,"result":stats(kind == "pause")
+                        "v":5,"id":id,"ok":true,"result":stats(kind == "pause")
                     }),
                     "subscribe" => {
                         write(
                             &mut reader,
-                            &json!({"v":4,"stream":"ready","result":{"subscribed":true}}),
+                            &json!({"v":5,"stream":"ready","result":{"subscribed":true}}),
                         )
                         .await;
                         write(
                             &mut reader,
-                            &json!({"v":4,"stream":"event","event":event_payload(12)}),
+                            &json!({"v":5,"stream":"event","event":event_payload(12)}),
                         )
                         .await;
                         write(
                             &mut reader,
-                            &json!({"v":4,"stream":"stats","stats":stats(false)}),
+                            &json!({"v":5,"stream":"stats","stats":stats(false)}),
                         )
                         .await;
                         // Keep the stream open until the client goes away.
@@ -119,7 +127,7 @@ async fn fake_daemon(path: PathBuf, seen: Arc<Mutex<Vec<Value>>>) {
                         let _ = reader.read_to_end(&mut sink).await;
                         return;
                     }
-                    other => json!({"v":4,"id":id,"ok":false,"error":format!("unknown {other}")}),
+                    other => json!({"v":5,"id":id,"ok":false,"error":format!("unknown {other}")}),
                 };
                 write(&mut reader, &reply).await;
             }
@@ -291,8 +299,59 @@ async fn requests_reach_the_wire_as_one_line_each() {
         .expect("label request");
     assert_eq!(label["event_id"], 10);
     assert_eq!(label["label"], "a label with spaces");
-    assert_eq!(label["v"], 4);
+    assert_eq!(label["v"], 5);
     assert_eq!(label["id"], 2, "request ids are ordered per connection");
+    drop(recorded);
+    let _ = std::fs::remove_file(&socket);
+}
+
+#[tokio::test]
+async fn allow_add_round_trip_and_error() {
+    let socket = std::env::temp_dir().join(format!("jevmon-fake-{}-d.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    tokio::spawn(fake_daemon(socket.clone(), Arc::clone(&seen)));
+
+    let (cmd_tx, cmd_rx) = mpsc::channel::<DaemonCmd>(8);
+    let (out_tx, mut out_rx) = mpsc::channel::<DaemonMsg>(64);
+    tokio::spawn(client::run(socket.clone(), cmd_rx, out_tx));
+    while !matches!(next(&mut out_rx).await, DaemonMsg::Stats(_)) {}
+
+    cmd_tx
+        .send(DaemonCmd::AllowAdd {
+            rule: "/usr/bin/git status *".to_string(),
+        })
+        .await
+        .unwrap();
+    match next(&mut out_rx).await {
+        DaemonMsg::AllowAdded {
+            rule,
+            count,
+            changed,
+        } => {
+            assert_eq!(rule, "/usr/bin/git status *");
+            assert_eq!(count, 1);
+            assert!(changed);
+        }
+        other => panic!("expected the allow reply, got {other:?}"),
+    }
+    cmd_tx
+        .send(DaemonCmd::AllowAdd {
+            rule: "*".to_string(),
+        })
+        .await
+        .unwrap();
+    match next(&mut out_rx).await {
+        DaemonMsg::Failed(error) => assert!(error.contains("every launch"), "error: {error}"),
+        other => panic!("expected a failure report, got {other:?}"),
+    }
+    drop(cmd_tx);
+    let recorded = seen.lock().unwrap();
+    let add = recorded
+        .iter()
+        .find(|r| r["type"] == "allow_add")
+        .expect("allow_add request");
+    assert_eq!(add["rule"], "/usr/bin/git status *");
     drop(recorded);
     let _ = std::fs::remove_file(&socket);
 }

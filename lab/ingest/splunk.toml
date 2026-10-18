@@ -1,0 +1,104 @@
+# Splunk attack_data (Linux sysmon + auditd). The only label source is the technique folder a log
+# came from: folder -> ATT&CK technique -> tactic -> class. Background launches in the same logs
+# (agent polling, package hooks) share the folder, so the folder label is weak; the reviewed sample
+# (review sheet) is what the headline numbers use. Tactic of a technique is ATT&CK's own taxonomy.
+
+source = "splunk-attack-data-linux"
+review_size = 300
+seed = 7
+# A launch whose key shows up in at least this many different technique folders, or that repeats
+# this many times inside one log, is polling/background and stays unlabelled (role = background).
+background_min_folders = 3
+background_min_repeats = 10
+
+[tactic_class]   # tactic -> class
+execution = "crit"
+persistence = "crit"
+privilege-escalation = "crit"
+defense-evasion = "crit"
+credential-access = "crit"
+command-and-control = "crit"
+exfiltration = "crit"
+impact = "crit"
+lateral-movement = "crit"
+resource-development = "crit"
+initial-access = "crit"
+discovery = "warn"
+collection = "warn"
+
+[[rule]]
+id = "tactic-class"
+when = { tactic = [
+  "execution", "persistence", "privilege-escalation", "defense-evasion", "credential-access",
+  "command-and-control", "exfiltration", "impact", "lateral-movement", "resource-development",
+  "initial-access",
+] }
+to = "crit"
+uncertain = "folder label: the launch may be background in a hostile replay"
+[[rule]]
+id = "tactic-warn"
+when = { tactic = ["discovery", "collection"] }
+to = "warn"
+uncertain = "folder label (discovery/collection counted as warn); the launch may be background"
+[[rule]]
+id = "unknown-tactic"
+when = {}
+to = "null"
+
+# technique id (folder name prefix) -> primary ATT&CK tactic (enterprise matrix, first listed tactic)
+[technique_tactic]
+T1003 = "credential-access"
+T1014 = "defense-evasion"
+T1016 = "discovery"
+T1021 = "lateral-movement"
+T1027 = "defense-evasion"
+T1030 = "exfiltration"
+T1033 = "discovery"
+T1036 = "defense-evasion"
+T1037 = "persistence"
+T1046 = "discovery"
+T1053 = "execution"
+T1057 = "discovery"
+T1059 = "execution"
+T1068 = "privilege-escalation"
+T1082 = "discovery"
+T1083 = "discovery"
+T1098 = "persistence"
+T1102 = "command-and-control"
+T1105 = "command-and-control"
+T1115 = "collection"
+T1129 = "execution"
+T1136 = "persistence"
+T1140 = "defense-evasion"
+T1190 = "initial-access"
+T1200 = "initial-access"
+T1204 = "execution"
+T1222 = "defense-evasion"
+T1485 = "impact"
+T1489 = "impact"
+T1496 = "impact"
+T1505 = "persistence"
+T1529 = "impact"
+T1531 = "impact"
+T1542 = "persistence"
+T1543 = "persistence"
+T1546 = "persistence"
+T1547 = "persistence"
+T1548 = "privilege-escalation"
+T1552 = "credential-access"
+T1555 = "credential-access"
+T1562 = "defense-evasion"
+T1564 = "defense-evasion"
+T1567 = "exfiltration"
+T1569 = "execution"
+T1572 = "command-and-control"
+T1574 = "persistence"
+T1608 = "resource-development"
+T1610 = "execution"
+
+# folders outside attack_techniques/Txxxx/, and folders whose own name says more than the technique
+[folder_tactic]
+"emerging_threats/react2shell" = "initial-access"
+"suspicious_behaviour/linux_post_exploitation" = "discovery"
+"malware/awfulshred" = "impact"
+"attack_techniques/T1059.004/linux_discovery_tools" = "discovery"

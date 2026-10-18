@@ -1,7 +1,7 @@
 # jevmon app
 
-The `app/` project holds everything that runs on the machine being monitored: the `/proc`
-poller, the context builder, the judge, the event store, the daemon (`jevmond`), the command line
+The `app/` project holds everything that runs on the machine being monitored: the exec sources
+(an eBPF helper stream, or a `/proc` poller), the context builder, the judge, the event store, the daemon (`jevmond`), the command line
 (`jevmon`) and the terminal UI (`jevmon-tui`). The lab, scenarios and experiments are in
 [`../lab/`](../lab/README.md). For a short overview and screenshots see the
 [root README](../README.md).
@@ -12,17 +12,26 @@ Contents: [usage](#usage) - [architecture](#architecture) - [install and run](#i
 
 ## What it does
 
-- Daemon (`jevmond`): polls `/proc` for new process launches, builds a short text context for
+- Daemon (`jevmond`): reads new process launches (every exec from the eBPF helper, or a share of
+  them by polling `/proc`), builds a short text context for
   each one, asks a small model whether the launch is `safe`, `warn` or `crit`, and stores the
   verdict with the context it was made from. It serves a Unix socket.
 - TUI (`app/tui/`, Rust, Ratatui): a client of that socket. List and detail views, filtering,
   labelling, acknowledging, pausing the judge.
-- `jevmon`: `exec` runs the same pipeline in the foreground, `label` and `ack` write to a
-  store, `ctl` talks to a running daemon (`status`, `events`, `label`, `ack`, `pause`,
-  `resume`, `shutdown`).
+- `jevmon`: `start`, `stop` and `status` bring the daemon up and down, `exec` runs the same
+  pipeline in the foreground, `label` and `ack` write to a store, `ctl` talks to a running daemon
+  (`status`, `events`, `label`, `ack`, `pause`, `resume`, `shutdown`).
 
-It reads `/proc` as the current user, so it needs no privileges, auditd or eBPF. The model runs
-offline from a cached checkpoint; nothing leaves the machine.
+Two exec sources, chosen with `[exec] source`:
+
+| source | sees | needs |
+| --- | --- | --- |
+| `ebpf` (default) | every successful exec, with up to 4 KB of argv | a small root helper (`jevmon-exec`) that jevmon starts for you; the daemon, CLI and TUI stay unprivileged |
+| `proc` | processes alive at a scan instant, so a share of short launches | nothing: it reads `/proc` as the current user |
+
+There is no automatic switch between them. With `ebpf` and no helper running, the daemon says so
+in `jevmon status`, `ctl status` and the TUI header and keeps retrying. The model runs offline
+from a cached checkpoint; nothing leaves the machine.
 
 ## Design principle
 
@@ -43,7 +52,10 @@ Two consequences:
 Run `direnv allow` (or `nix develop`) once, then:
 
 ```sh
-just exec                 # poll /proc and judge; print crit verdicts as JSON lines
+jevmon start              # the helper (ebpf source only, one password prompt) and the daemon
+jevmon status             # configured source, helper, daemon (no privileges)
+jevmon stop
+just exec                 # judge in the foreground; print crit verdicts as JSON lines
 just exec --once          # one scan, print a summary
 just exec --db /tmp/e.db  # store verdicts at a given path
 just daemon               # jevmond in the foreground, serving the socket
@@ -76,6 +88,7 @@ severity, never a class name.
 | mouse wheel, click | scroll the focused pane; select a row (the newest row resumes follow) |
 | `t` / `f` | label the selected event true-positive / false-positive |
 | `y` | acknowledge the selected event |
+| `a` | allow launches like the selected one (detail pane open): choose a scope, `enter` adds the rule, `esc` cancels |
 | `p` | pause or resume judging (the poller keeps running) |
 | `/` | text filter on the command; `enter` applies, `esc` cancels |
 | `u` | show unlabelled events only |
@@ -95,6 +108,7 @@ severity, never a class name.
 | `jevmon ctl status` | model, device, poller and judge counters of a running daemon, as JSON |
 | `jevmon ctl events [--since-id N] [--min-severity N] [--limit N] [--unlabeled] [--text S]` | query stored events as JSON |
 | `jevmon ctl label <id> <label>`, `ack <id>` | label or acknowledge through the daemon |
+| `jevmon ctl allow list`, `add <rule>`, `remove <rule>` | show or edit the `[filter] allow` rules; changes are written to the config file and applied live |
 | `jevmon ctl pause`, `resume`, `shutdown` | control the daemon |
 
 `jevmon ctl` takes `--socket PATH` before the subcommand.
@@ -102,15 +116,56 @@ severity, never a class name.
 ## Architecture
 
 ```
-/proc  ->  ExecSource  ->  ContextBuilder  ->  Judge (queue, memo, batches)  ->  SQLite store
- tier 0     detect new      facts -> text       Laya model, optional head          |
-            pids, count     (redacted,                                             v
-            misses          sanitized)                          jevmond socket (protocol v4)
-                                                                      |           |
-                                                                  jevmon ctl    jevmon-tui
+jevmon-exec (root, eBPF) --socket--> EbpfSource  --+
+/proc ------------------------------> ExecSource  --+-> allow rules -> ContextBuilder -> Judge -> SQLite store
+                                        (poller)         (optional)     facts -> text    queue, memo,      |
+                                                                        (redacted,       batches            v
+                                                                        sanitized)            jevmond socket (protocol v4)
+                                                                                                    |           |
+                                                                                                jevmon ctl    jevmon-tui
 ```
 
-### Source: tier 0 and tier 0+ (`app/src/jevmon/sources/`)
+### Source: ebpf (`sources/ebpf.py`, `app/helper/`)
+
+`jevmon-exec` is a small C program: a CO-RE BPF program on `sched_process_exec` plus a loader.
+It runs as root with only `CAP_BPF`, `CAP_PERFMON` and `CAP_SYS_RESOURCE`, no network and a
+read-only filesystem, and does nothing but stream events to a unix socket in `/run/jevmon/`.
+It accepts no commands. A client is served only if `SO_PEERCRED` shows the uid the helper was
+started for (`--uid`); any other connection is closed without a byte.
+
+`sched_process_exec` fires after an exec succeeded, so failed `execve` calls (a shell probing
+`PATH`, `EACCES`) never appear. Per exec the helper reports: pid, ppid, uid/euid/gid, process
+and parent start time, cgroup id, `comm` and the parent's `comm`, the resolved path of the file
+that runs as `exe` (walked from the kernel's `bprm->file`: symlinks and the nix profile are
+resolved, a script reports its interpreter, like `/proc/<pid>/exe`), the raw `execve` argument as
+`filename`, up to 4096 bytes of argv split into at most 64 arguments, a truncation flag, a
+monotonic and a wall timestamp.
+
+The wire format is newline-delimited JSON: a `hello` line (protocol version, limits), one `exec`
+line per exec, and a `hb` line every second with exact totals: execs seen by the kernel program,
+records lost because the ring buffer was full, events not delivered to the client. Nothing is
+dropped uncounted; `jevmon status` and `ctl status` show `exec_lost`, `exec_client_dropped`,
+the per-second rate and the busiest second.
+
+The source parses each line into the same event the poller produces. The parent's command comes
+from a bounded cache of recent execs keyed by pid and checked against the parent's start time,
+so a reused pid is never mistaken for the parent; a parent that exec'd before the helper started
+is known by its `comm` only. Nothing is read from `/proc` per exec (so no races); `cwd` is not
+collected, and `cgroup` is the path resolved from the cgroup id by a rate-limited walk of
+`/sys/fs/cgroup` (empty when the cgroup is already gone). The reader has a CPU ceiling
+(`helper_cpu_budget`): above it, it stops reading and the helper counts the events it could not
+deliver.
+
+If the helper is missing the source reports `exec source unavailable (helper not running)`,
+reconnects with exponential backoff (`helper_retry_min` to `helper_retry_max`) and never turns
+into polling.
+
+Volume is handled after the source: the allow rules, the memo (a situation is judged once) and the
+bounded judge queue. Verdicts for a situation already stored in the last `coalesce_seconds`
+(default 60) are counted (`coalesced`) instead of stored again, and the learned counts are kept
+in memory and written once a second. See [measured performance](#measured-performance).
+
+### Source: proc, tier 0 and tier 0+ (`app/src/jevmon/sources/exec.py`)
 
 Tier 0 polls `/proc` and diffs pids. A pid is a new launch when it is unseen, when its
 `(pid, starttime)` changed (pid reuse), or when its argv or exe changed while the start time held
@@ -160,13 +215,16 @@ found no gain from them yet (see the [lab README](../lab/README.md)), so the def
 
 - The judge interface is the typed-question API shape Laya and the hosted Jev models share (a
   state string plus named `choice` questions with per-category descriptions in, probabilities out).
-- The model is [Laya](https://huggingface.co/convaiinnovations/laya) (ModernBERT-large, 421M
-  parameters), answering a typed choice question over the three class descriptions from
-  `[judge.categories]`. Its answer is the verdict and its severity (`safe` 0, `warn` 1, `crit`
-  2). The confidence is stored and shown, and nothing is thresholded on it.
-- `[judge] tuned` replaces the zero-shot choice with a small classification head over the frozen
-  encoder (a `.safetensors` written by `lab/scripts/finetune_head.py` or `train_head_v3.py`). Its classes
-  must be the three above.
+- Five judge models are available, selected in the configuration. Each is a classifier over a
+  local or downloaded encoder, trained on a mixed pool of labelled launches and shipped with the
+  app: [Laya](https://huggingface.co/convaiinnovations/laya) (ModernBERT-large, 421M parameters,
+  the default), `laya-lora` (the same Laya encoder with a small LoRA adapter merged into the
+  weights at load, no extra dependency), `jhu-clsp/ettin-encoder-1b`, `ettin-lora` (Ettin with a
+  LoRA adapter merged in) and `Qwen/Qwen3-Embedding-8B`. Laya and `laya-lora` are the smallest and
+  the ones meant for ordinary machines; the others are larger backbones. Without a head, Laya answers a zero-shot typed
+  choice question over the three class descriptions from `[judge.categories]`.
+- The model's answer is the verdict and its severity (`safe` 0, `warn` 1, `crit` 2). The
+  confidence is stored and shown, and nothing is thresholded on it.
 - Volume is handled by memoisation, not filtering: each distinct context signature is judged once
   and reused for `memo_ttl_seconds`; the signature changes as statistics move, so the context is
   judged again.
@@ -211,10 +269,36 @@ shell pins Python, uv, just and ruff.
 ```sh
 nix develop            # or `direnv allow`
 just sync              # app/.venv, CPU wheels
-just exec --once       # one scan, print a summary
-just exec              # poll and judge; print crit verdicts as JSON lines
-just daemon            # jevmond in the foreground
+just daemon-install    # the unprivileged user service (see below)
+just exec-build        # the exec helper, once (nix build into app/helper/result)
+jevmon start           # starts the helper if [exec] source = "ebpf", then the daemon
+jevmon status
 just tui               # build and open the TUI
+jevmon stop
+```
+
+With `source = "ebpf"` (the default) `jevmon start` asks for a password once, only to start the
+helper as a transient system unit (`systemd-run --unit=jevmon-exec`) through `run0`, else
+`sudo`, else `pkexec`. The daemon and everything else stay unprivileged. The helper path is
+resolved first and must be in the nix store or owned by root in root-owned directories; a path
+you can write is refused. A transient helper lasts until `jevmon stop` or a reboot. To have the
+helper start at boot instead, `just exec-install` installs a system service
+([`contrib/jevmon-exec.service`](contrib/jevmon-exec.service)) for your uid; `jevmon stop` then
+leaves it running. `just exec-uninstall` removes it. With `source = "proc"` nothing is ever
+elevated.
+
+Checks without touching the host: `just exec-trace 10` runs only the helper for 10 seconds
+(one `sudo`) and prints a summary. `just exec-vmtest` loads the BPF program in a throwaway
+NixOS VM under qemu (needs `/dev/kvm`, no root) and lists what it recorded.
+
+Advanced: `jevmon helper start|stop` runs just the elevated step.
+
+The foreground commands still work without the service:
+
+```sh
+just exec --once       # one /proc scan, print a summary
+just exec              # judge in the foreground; print crit verdicts as JSON lines
+just daemon            # jevmond in the foreground
 just run jevmon ctl status
 ```
 
@@ -245,7 +329,7 @@ just daemon-stop       # also: daemon-start, daemon-restart, daemon-uninstall
 The unit is [`contrib/jevmond.service`](contrib/jevmond.service). It runs the daemon from the
 repository checkout with `VIRTUAL_ENV` set to `app/.venv-gpu`, `Nice=10`, `CPUQuota=200%` and
 `MemoryMax=8G`, and restarts on failure. `WorkingDirectory` is the repository root so relative
-config paths such as `models/lab-head-v4.safetensors` resolve. The unit file assumes the checkout is at
+config paths such as `models/my-head.safetensors` resolve. The unit file assumes the checkout is at
 `~/dev/jevmon`; edit it if yours is elsewhere. For a CPU-only service the file has the
 alternative `ExecStart` in a comment.
 
@@ -258,11 +342,77 @@ only the keys you change. Unknown keys are an error. The daemon re-reads the fil
 
 | section | what it controls |
 | --- | --- |
-| `[exec]` | source (`proc` or `replay`), poll `interval`, `min_interval` / `max_interval`, `cpu_budget` (default 0.03 of one core), `max_pids`, `max_tracked`, `summary_seconds`, `parent_argv`, `replay_file` |
+| `[exec]` | `source` (`ebpf`, `proc` or `replay`); ebpf: `helper_socket` (default `/run/jevmon/exec.sock`), `helper_path`, `helper_retry_min` / `helper_retry_max` (backoff seconds), `recent_exec_max` (parent cache size), `helper_cpu_budget` (reader ceiling, default 0.5 of one core); proc: poll `interval`, `min_interval` / `max_interval`, `cpu_budget` (default 0.03 of one core), `max_pids`, `max_tracked`; both: `summary_seconds`, `parent_argv`, `facts`, `replay_file`. The ebpf keys are accepted and ignored when another source is selected |
 | `[context]` | what the model reads: `order` of segments, `sep`, `model_max` characters, `argv_max`, `template_tokens`, rarity settings, `sibling_seconds` |
-| `[judge]` | `mode` (`laya` or `fake`), `question`, `tuned` head file, `checkpoint` / `checkpoint_dir`, `device`, `dtype`, `batch_size`, `threads`, `threads_gpu`, `memo_ttl_seconds`, `queue_capacity` |
+| `[judge]` | `mode` (`laya` or `fake`), `model` (the shipped judge: `laya` / `laya-lora` / `ettin` / `ettin-lora` / `qwen3e`), `question`, `tuned` head override, `checkpoint` / `checkpoint_dir`, `device`, `dtype`, `batch_size`, `threads`, `threads_gpu`, `memo_ttl_seconds`, `queue_capacity` |
 | `[judge.categories]` | the three classes and what each means, as prompt text |
+| `[store]` | `retention_days`, `queue_capacity`, `store_exec_events`, `coalesce_seconds` (ebpf: repeated memoised verdicts are counted, not stored) |
+| `[filter]` | `allow` rules that skip the judge for launches you have decided are routine, `store_skipped` |
 | `[store]` | `retention_days`, queue capacity, whether plain exec events are persisted |
+
+### `[filter]`: allow rules
+
+Launches matching an allow rule are not judged; everything else is. The code contains no rules and
+the shipped `allow` list is empty. On a busy agent workstation a few processes (read-only `git`
+queries, compilers and linkers, build caches, `rocm-smi`-style pollers) run hundreds of times a
+minute and make up most of the execs, so the owner can allow the ones they know are routine. A
+full exec feed produces more distinct launches per second than the model can judge, which is what
+this is for. Setting `allow` in your config replaces the default list as a whole.
+
+```toml
+[filter]
+allow = [
+  "git rev-parse *",
+  "git config --get *",
+  "/nix/store/*-clang-*/bin/clang -c *",
+  "rocm-smi *",
+]
+store_skipped = false
+```
+
+A rule is `"<exe> <args>"`, in the style of Claude Code permission rules:
+
+- The exe part is a glob. If it starts with `/` or `*` it is matched against the full exe path.
+  Otherwise it is matched against the exe basename. A bare name such as `git` matches a binary
+  of that name in any directory, so a renamed or copied binary (`/tmp/git`) matches too; an
+  absolute path (`/nix/store/*-git-*/bin/git`) does not. Use absolute paths where the path is
+  stable.
+- The args part is a glob over `argv[1:]` joined with single spaces. `*` is the only wildcard and
+  matches any run of characters, spaces included. Everything else is literal.
+- A rule with only an exe part matches that exe with no arguments.
+- A trailing ` *` needs a space boundary: `git diff *` matches `git diff` and `git diff HEAD`,
+  not `git diffx`. `git diff:*` means the same as `git diff *`.
+- To match a literal `*` or `\` in an argument, write `\*` or `\\`. A backslash before any other
+  character is literal.
+- `<exe> *` matches that exe with any arguments, including none.
+- Rules are checked in order; the first match wins. An empty rule is a config error that lists
+  the rule.
+
+Rules can be added from the TUI. With the detail pane open, `a` offers three scopes for the
+selected launch and shows the rule that would be written:
+
+- exact: the exe path and these exact arguments;
+- prefix: the exe path, the first `k` arguments and ` *`; `k` starts at 1 (the subcommand) and
+  changes with `left` / `right` or `-` / `+`;
+- exe only: the exe path and ` *`.
+
+The rule always uses the full exe path. For `git -C /w/repo diff --name-only HEAD` the prefix
+rule is `/nix/store/...-git-2.55.0/bin/git -C *`; for `clang -c src/a.c -o build/a.o` it is
+`/nix/store/...-clang-21/bin/clang -c *`. `enter` sends it to the daemon, which appends it to
+`[filter] allow` in your config file (`$XDG_CONFIG_HOME/jevmon/config.toml`, created if missing;
+comments and ordering are kept), applies it to the running matcher and de-duplicates. If the file
+has no `allow` key yet, the shipped list is copied in first, since a list in your file replaces
+it. The selected event stays in the list; later matching launches are skipped. `jevmon ctl allow`
+does the same from the command line. Errors (invalid rule, unwritable file) show in the TUI status
+line.
+
+Children of an allowed process (hooks, aliases, ssh commands) are separate execs and are still
+judged. Matching uses the exe path and argv as the source recorded them, after secret redaction
+and length bounds. Both sources report the resolved exe path (a Nix store path, not the
+profile symlink); the ebpf source also records the raw `execve` argument as `filename`.
+
+Skipped launches are counted: `allow_skipped` and `allow_hits` (hits per rule) in `jevmon ctl
+status`. With `store_skipped = true` they are also stored as unjudged events with reason `allow`.
 
 The `fake` judge mode and the `replay` source are deterministic stand-ins used by the tests and
 by the screenshot recording; they involve no model and no real processes.
@@ -285,28 +435,32 @@ rate or a trend.
 
 `safe` means the model saw nothing to act on. It does not mean the launch was checked.
 
-Zero-shot. With `tuned = ""` the model answers a typed choice question over the class
-descriptions in `[judge.categories]`. The descriptions are the prompt; rewrite them for your own
-machine. On the lab's held-out rows this is close to always answering safe.
+Shipped heads. Every selectable judge is a classifier over a local or downloaded encoder, fitted on
+the mixed lab pool and packaged with the app. `[judge] model` picks it; `tuned` overrides the
+packaged head for that model with your own `.safetensors` file.
+
+| `model` | backbone | measured cost on this box's iGPU |
+| --- | --- | --- |
+| `laya` (default) | the local Laya encoder, frozen linear head | 42-44 ms per context |
+| `laya-lora` | the same Laya encoder, LoRA adapter merged in at load | same as `laya` (60 ms p50 / 116 ms p95 per context at batch 1 through the judge path, against 60 / 116 for `laya`) |
+| `ettin` | `jhu-clsp/ettin-encoder-1b` (encoder) | not measured |
+| `ettin-lora` | the same Ettin encoder, LoRA adapter merged in at load | not measured; the merge adds no forward-pass cost over `ettin` |
+| `qwen3e` | `Qwen/Qwen3-Embedding-8B` (decoder) | not measured; an 8B encoder, so it needs a GPU with spare memory |
+
+`laya` is recommended for ordinary machines: it is small, runs on the iGPU or CPU, and needs no
+download. `laya-lora` is the same Laya encoder with a small LoRA adapter (27.5 MiB) folded into the
+weights at load: no `peft` at runtime, no extra download beyond the Laya checkpoint, and about the
+same latency as `laya`. `ettin-lora` does the same for Ettin-1B (a 22.1 MiB adapter). The Hugging Face backbones load lazily, only when selected, and need the
+optional extra (`uv sync --extra backbone`); the model is downloaded from Hugging Face on first use.
+A selected backbone that cannot load is reported in `ctl status` and the judge reports itself
+unavailable; it never falls back to Laya. A broken Laya head or LoRA adapter still degrades to the
+zero-shot typed question over the class descriptions (a small, always-near-`safe` baseline); a broken
+backbone head makes the judge unavailable.
 
 ```toml
 [judge]
-tuned = ""
-question = "Is this process launch expected on this machine?"
-
-[judge.categories]
-safe = "normal operation for this machine"
-warn = "unexpected but plausibly harmless"
-crit = "possible attack, intrusion or abuse"
-```
-
-Shipped head. A small classifier over the frozen encoder, trained on labelled lab contexts, is
-packaged with the app and loaded by default (`tuned = "lab-head-v4"`, 12.5 KB). To use your own,
-give a path to a `.safetensors` file; its classes must be the three above.
-
-```toml
-[judge]
-tuned = "models/my-head.safetensors"
+model = "laya"                        # "laya" | "laya-lora" | "ettin" | "ettin-lora" | "qwen3e"
+tuned = "models/my-head.safetensors"  # empty = the packaged head for `model`
 ```
 
 Device and source settings:
@@ -330,9 +484,40 @@ otherwise; `jevmon ctl status` shows which one is in use.
 
 ## Measured performance
 
-All numbers are from one workstation (32 cores, AMD Radeon 8060S iGPU, 740 to 960 pids running)
-with short interleaved runs; treat the digits as plus or minus 10 percent. Measured on
-2026-10-12 (poller, judge) and 2026-10-14 (accuracy); code at commit `4482c98`.
+### ebpf source: load shape and daemon cost
+
+The stream the bench replays is synthetic (`app/scripts/bench_ebpf.py`), shaped like a
+30-second eBPF capture of a busy workstation: 170 execs/s on average with peaks above 400, about
+480 distinct executables with a skewed frequency, 7 arguments and about 100 bytes of argv at the
+median, and about 14 new masked templates per second (`masked_template([exe] + argv[1:])`, 416
+in 30 s). A fake helper serves it over a unix socket at a fixed rate in the helper's wire format;
+the daemon side (socket, parse, redaction, allow check, context build, memo, judge queue, store)
+runs unchanged, with a stand-in model that sleeps 45 ms per context (a GPU wait, no CPU) and a
+SQLite store. The CPU column is the daemon process; the model's own CPU (tokenizing, at most
+about 22 judged contexts/s) is not included.
+
+| run | rate | daemon CPU | observed | judged | memo hit rate | shed | max queue age |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| cold store, 60 s | 500/s | 11% of one core | 29,999 | 1,334 | 84% | 0 | 49 s (cold-start backlog) |
+| warm store, 60 s | 500/s | 12% | 29,999 | 1,332 | 95.5% | 0 | 20 s (at the start) |
+| warm store, 30 s | 2,000/s | 31% | 59,991 | 673 | 98.2% | 0 | 27 s |
+
+Nothing was shed and the helper's lost counter stayed 0. The judge is the bottleneck: it handles
+about 22 new situations per second, so a cold store (every situation new, and the count buckets
+in the memo signature still moving) queues a backlog of a few thousand contexts that drains in
+about a minute; verdicts for those are late by up to the queue age. When the queue is full
+(`queue_capacity`) contexts are stored `judged=false` and counted as `dropped`. The reader's
+own ceiling is `helper_cpu_budget`.
+
+Two changes made this possible, both used only by the ebpf source: the learned counts and the
+rarity window are kept in memory and written once a second (before, a store query per exec
+pegged a core at about 300 execs/s), and a memoised verdict for a situation already stored in
+the last 60 s is counted, not stored again (`coalesced`).
+
+### Polling numbers
+
+The rest of this section is about the `proc` source and the judge. All numbers are from one workstation (32 cores, AMD Radeon 8060S iGPU, 740 to 960 pids running)
+with short interleaved runs; treat the digits as plus or minus 10 percent.
 
 ### Summary
 
@@ -343,38 +528,45 @@ with short interleaved runs; treat the digits as plus or minus 10 percent. Measu
 | scan time p50 / p95 | 24 ms / 42 ms at 740 to 960 pids | same |
 | poll interval | about 1.29 s effective (configured 0.1 s, widened by the budget) | same |
 | missed launches, real box | 0.974 (estimated from `/proc/stat`, upper bound) | same, with about 230 short processes/s |
-| missed launches, lab capture | 0.956 to 0.961 | E14, E15 lab captures |
-| per-launch fact cost | about 37 microseconds of poller CPU per new process | `[exec] facts`, E17 |
+| missed launches, lab capture | 0.956 to 0.961 | lab captures |
+| per-launch fact cost | about 37 microseconds of poller CPU per new process | `[exec] facts` |
 | judge latency, iGPU bf16 | 65 ms (batch 1), 55 ms (8), 44 ms (32) per context | `bench_judge.py` |
+| judge latency, `laya-lora` vs `laya`, iGPU bf16 | 59.7 / 59.9 ms p50 and 98.5 / 115.9 p95 per context at batch 1; 104.6 / 103.0 p50 at batch 32 | `bench_lora.py` |
 | judge latency, CPU, 2 threads | 2506 ms per context, batch 1 (5021 ms CPU time) | `bench_judge.py` |
 | judge latency, CPU, 8 threads | 787 ms per context, batch 1 | `bench_judge.py` |
 | throughput, iGPU | 15 to 22 contexts/s; about 0.75/s need the model after memoisation | live daemon, 20 s |
 | model memory | about 3.9 GiB GTT with one Laya resident; 0.42 GiB peak VRAM | sysfs counters |
-| size on disk | Laya checkpoint 2.3 GiB (HF cache); shipped head 12.5 KB | filesystem |
+| size on disk | Laya checkpoint 2.3 GiB (HF cache); Laya head 12.5 KB | filesystem |
 | daemon idle and active CPU | not measured | |
 | store size per day | not measured | |
 | TUI memory and CPU | not measured | |
 
 ### Accuracy
 
-Macro-F1 on the held-out lab rows (E15 pool: 420 rows, 61 families; one synthetic capture).
-Family-cluster bootstrap 95% CI; paired differences between rows have CIs of about plus or minus
-0.12, so only the gap to zero-shot is clear.
+The five shipped judges on the lab held-out (417 rows, 61 script families), macro-F1 with a 95%
+family-cluster bootstrap CI. The LoRA rows are the per-seed mean ± sd over three seeds (each
+shipped file is a single seed). The set is small and synthetic, so the CIs are wide and overlap.
+Every set, the per-set splits and the method are in the [root README](../README.md#accuracy) and
+[lab/README.md](../lab/README.md).
 
-| judge | macro-F1 [95% CI] | source |
-| --- | --- | --- |
-| always answer safe | not measured on the pool; 0.185 on the earlier 130 rows | E12 |
-| Laya, zero-shot | 0.391 | E15 stage 1 |
-| Laya with the shipped head | 0.667 [0.53, 0.77] | E15, E18 |
-| Foundation-Sec-8B with a head (not shipped) | 0.709 [0.58, 0.81] | E18 |
-| hosted Jev 1.13, zero-shot (flat text) | 0.616 [0.50, 0.71] | E18 |
+| judge | lab held-out macro-F1 [95% CI] |
+| --- | --- |
+| Laya, default | 0.519 [0.40, 0.63] |
+| Laya-LoRA | 0.582 ± 0.046 |
+| Ettin-1B | 0.638 [0.50, 0.74] |
+| Ettin-LoRA | 0.669 ± 0.020 |
+| Qwen3-Embedding-8B | 0.688 [0.56, 0.79] |
+| zero-shot Laya | 0.411\* |
+| always answer safe | 0.185 |
 
-Foundation-Sec-8B costs 179 ms p50 per context at batch 1 and 16.1 GiB of GPU memory, against
-44 ms and about 4 GiB for Laya, and its gain is not distinguishable from zero. Hosted Jev was
-queried over the network (median 0.42 s per request) and about 4% of its verdicts change when the
-same request is repeated.
+\* On the original 130-row held-out subset, not the full 417-row pool.
 
-### Poller
+Laya runs a context in 42-44 ms on the iGPU and holds about 4 GiB; `laya-lora` runs at the same
+speed (the merge leaves no runtime `peft` and no extra forward pass) with a 27.5 MiB adapter file.
+Qwen3-Embedding-8B is an 8B encoder of the class measured at 95-179 ms per context and 16.1 GiB of
+GPU memory; Ettin-1B and `ettin-lora` were not measured on the iGPU.
+
+### Poller (proc source)
 
 62 seconds at the shipped defaults, with a loop launching about 230 short-lived processes per
 second in the background:
@@ -419,16 +611,22 @@ characters built by the real context builder. "CPU ms" is process CPU time per c
 
 ### Zero-shot and tuned verdicts
 
-In the first lab run the zero-shot model gave the same answer
-(`routine`, in the four-class setup of the time) for every one of 563 recorded contexts. A head
-trained on lab labels does clearly better, but the evidence is small and synthetic. The
-[lab README](../lab/README.md) has the tables and their caveats.
+With no head, zero-shot Laya is close to always answering `safe` on the lab rows. The shipped
+heads, trained on a mixed pool of labelled launches, do clearly better, but the lab data is small
+and synthetic and the external labels are machine-derived, so treat the gap as indicative rather
+than established. The [lab README](../lab/README.md) has the tables and their caveats.
 
 ## Limitations
 
-- Coverage. Tier 0 only sees processes alive at a scan instant. Short-lived commands are
-  missed, as measured above. Exact launch events need a stronger source (a process connector or
-  audit with a capability, or eBPF), which this project does not use.
+- Coverage. The `proc` source only sees processes alive at a scan instant; short-lived commands
+  are missed, as measured above. The `ebpf` source sees every successful exec, but needs the root
+  helper. It cannot see an `execve` that fails (by design), and a launch is lost only when the
+  helper's ring buffer or a slow client overflows, which is counted.
+- ebpf source details. argv is cut at 4096 bytes and 64 arguments (flagged `argv_truncated`);
+  `cwd` is not recorded; a parent that exec'd before the helper started has no exe or command in
+  the context; the helper's view is the host's (a process in a container reports paths as the
+  kernel sees them for that mount namespace's root, which may differ from the host path); a
+  process whose argv memory is not resident at exec time is recorded with empty argv and a flag.
 - Single launch. The judge sees one launch at a time. Rates and resource growth (fork storms,
   retry loops, memory growth) cannot be read from one launch and are out of scope for this
   judge.

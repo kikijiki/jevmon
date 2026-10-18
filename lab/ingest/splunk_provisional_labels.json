@@ -1,0 +1,1205 @@
+{
+"_status": "provisional, unreviewed: labels written by the assistant for the review sheet; the user has not checked them. Criterion: would a careful monitor want to know about this launch, judged from the launch (and its parent where the note says [parent]).",
+"labels": {
+"0000ab018e44": [
+"safe",
+"groups, users, command-not-found"
+],
+"0056f9824a1c": [
+"crit",
+"nohup binary from hidden dir in /tmp"
+],
+"0141757edc1a": [
+"crit",
+"rewrites authorized_keys"
+],
+"028334b36214": [
+"crit",
+"usermod to uid 0"
+],
+"02cb46de46f9": [
+"safe",
+"routine service or package helper"
+],
+"030887df81d1": [
+"crit",
+"gawk system shell"
+],
+"05d962f88039": [
+"safe",
+"apt install"
+],
+"06deae691dfc": [
+"crit",
+"[parent] awk system shell"
+],
+"07b8a018a463": [
+"crit",
+"[parent] su - spawned by an exploit binary"
+],
+"0a9cd35f7fd2": [
+"crit",
+"make --eval runs a command"
+],
+"0b0d040e7ad9": [
+"crit",
+"unload module named rootkit"
+],
+"0c5413396d9c": [
+"warn",
+"make --eval under sudo"
+],
+"0d93eef71e5c": [
+"safe",
+"routine system helper"
+],
+"0da74264bfda": [
+"warn",
+"decode from /tmp"
+],
+"0dff496e313e": [
+"safe",
+"apt install"
+],
+"0e31d1b185b6": [
+"safe",
+"id of a user"
+],
+"104df2b90f73": [
+"warn",
+"chmod 777 script"
+],
+"111063b46096": [
+"warn",
+"grep pattern for key or credential files"
+],
+"12fabd1a4446": [
+"warn",
+"read a privesc script"
+],
+"131d60aa7d66": [
+"crit",
+"rm -rf /etc/systemd/system"
+],
+"14689c85aee8": [
+"safe",
+"routine system helper"
+],
+"14d2a839201c": [
+"warn",
+"xclip of .bashrc"
+],
+"15bd5ad02d9a": [
+"warn",
+"grep pattern for key or credential files"
+],
+"16cb33001e35": [
+"safe",
+"whoami"
+],
+"17f8d3cf2f7f": [
+"warn",
+"grep pattern for key or credential files"
+],
+"181ea78c2a5e": [
+"safe",
+"routine service or package helper"
+],
+"18dc75aecfed": [
+"safe",
+"routine service or package helper"
+],
+"18f8b54b095c": [
+"safe",
+"xclip or man"
+],
+"19d4b17dd11f": [
+"crit",
+"docker build named malicious-container"
+],
+"1b0299321c05": [
+"crit",
+"mysql shell escape"
+],
+"1bc371147bbe": [
+"safe",
+"xclip or man"
+],
+"1bcd59813334": [
+"crit",
+"sudo composer run-script from /tmp"
+],
+"1c326e4c6558": [
+"warn",
+"dd on syslog"
+],
+"1c87d57c32e1": [
+"crit",
+"builds a shared object with an init hook"
+],
+"1f4f91a9935e": [
+"crit",
+"gdb shell escape"
+],
+"1fab6c4692bf": [
+"safe",
+"tomcat service start"
+],
+"1ffb028a6d59": [
+"crit",
+"LD_PRELOAD of a local library under sudo"
+],
+"208fa05a4cc7": [
+"safe",
+"id of a user"
+],
+"2251e2579ead": [
+"warn",
+"garbled sudo with script url"
+],
+"2251fd78df9c": [
+"safe",
+"routine service or package helper"
+],
+"22a865453e06": [
+"warn",
+"grep pattern for key or credential files"
+],
+"23ad630d536b": [
+"crit",
+"find -exec shell"
+],
+"24a9788e9b0a": [
+"safe",
+"add-apt-repository"
+],
+"24eb7df5c6b1": [
+"safe",
+"grep exclusion list of media extensions"
+],
+"25b36be65576": [
+"crit",
+"csvtool call shell"
+],
+"263c3e696b7f": [
+"safe",
+"awk filter"
+],
+"263cf75c00ac": [
+"safe",
+"routine system helper"
+],
+"267d38e5475e": [
+"warn",
+"grep pattern for key or credential files"
+],
+"267fe87fc4ec": [
+"safe",
+"base64 -d"
+],
+"2721ee5f1f04": [
+"crit",
+"puppet exec shell"
+],
+"281b9f54032e": [
+"crit",
+"openvpn --up runs a shell"
+],
+"288118a868db": [
+"warn",
+"grep pattern for database or credential files"
+],
+"28bd22a68fd0": [
+"crit",
+"php system shell"
+],
+"29f8ebf44147": [
+"warn",
+"grep pattern for key or credential files"
+],
+"2a065ce9764d": [
+"crit",
+"openvpn --up runs a shell"
+],
+"2b0cc4e99048": [
+"warn",
+"curl a raw ip:port"
+],
+"2c3dcaa73ac2": [
+"safe",
+"egrep of /proc/mounts"
+],
+"2cfd7f2dc425": [
+"warn",
+"encode and stage in /tmp"
+],
+"2d22c1a08612": [
+"warn",
+"download a script from github"
+],
+"2db19a0de8ef": [
+"crit",
+"[parent] shell exec from emacs"
+],
+"2e137bbfee7f": [
+"crit",
+"[parent] cat /etc/passwd from redis"
+],
+"2e4003e2ae7d": [
+"safe",
+"docker"
+],
+"2f8f9e092468": [
+"warn",
+"grep pattern for database or credential files"
+],
+"3097b59711d1": [
+"crit",
+"cpulimit spawns a shell"
+],
+"324c09b726a1": [
+"warn",
+"grep pattern for key or credential files"
+],
+"32f9b1edc79b": [
+"crit",
+"openvpn --up runs a shell"
+],
+"33c50c7ad59f": [
+"crit",
+"apt pre-invoke shell"
+],
+"3409750b1fe3": [
+"safe",
+"ls"
+],
+"3420356cd2cf": [
+"safe",
+"awk filter"
+],
+"346c32f90509": [
+"warn",
+"grep pattern for key or credential files"
+],
+"351b5c7d1979": [
+"crit",
+"gem open runs a shell"
+],
+"355f429a0583": [
+"safe",
+"ssh-keygen"
+],
+"377e00318600": [
+"warn",
+"grep pattern for key or credential files"
+],
+"37bb07f921ee": [
+"crit",
+"gdrive upload with token on the command line"
+],
+"38c59a2ed1b2": [
+"safe",
+"xclip or man"
+],
+"39a696178006": [
+"crit",
+"cron-like line to a script in /var/log, disown"
+],
+"3a4899fe5111": [
+"safe",
+"edit or view a script"
+],
+"3b17e8bb5971": [
+"safe",
+"routine service or package helper"
+],
+"3c1879690a24": [
+"safe",
+"routine service or package helper"
+],
+"3cccb69f4715": [
+"crit",
+"[parent] make --eval runs a command"
+],
+"4046280a01f7": [
+"safe",
+"id of a user"
+],
+"41547501fbe2": [
+"safe",
+"edit or view a script"
+],
+"425fd62414da": [
+"crit",
+"nc -e through sh $@|sh"
+],
+"432138667dee": [
+"warn",
+"gdb shell escape to test"
+],
+"433892e59d85": [
+"safe",
+"apt install"
+],
+"43fd576d05e5": [
+"warn",
+"grep pattern for key or credential files"
+],
+"45c4958c8ac2": [
+"crit",
+"node spawns a shell"
+],
+"472901708ea9": [
+"safe",
+"routine system helper"
+],
+"478a7e6e1bbc": [
+"crit",
+"php system shell"
+],
+"483fad1953a5": [
+"safe",
+"command-not-found"
+],
+"48c5b5b13431": [
+"safe",
+"crontab -l"
+],
+"49442591ffdc": [
+"safe",
+"hostname or grep exclusion"
+],
+"49a6ee785e07": [
+"warn",
+"grep pattern for session or credential files"
+],
+"4e272c3f6e6d": [
+"safe",
+"polling ps"
+],
+"4e4dfd29ae93": [
+"crit",
+"cpulimit spawns a shell"
+],
+"4f03cc189924": [
+"safe",
+"apt install"
+],
+"4f7f92edabb9": [
+"safe",
+"apt install"
+],
+"5020377e8517": [
+"crit",
+"privileged container with host pid"
+],
+"505760af8af2": [
+"warn",
+"grep pattern for database or credential files"
+],
+"5085121e714e": [
+"warn",
+"grep logs for su/sudo"
+],
+"509c3cf4de6c": [
+"warn",
+"ssh batch mode, host key check off, remote command"
+],
+"50db621bae50": [
+"safe",
+"apt install"
+],
+"518e5c36762c": [
+"safe",
+"apt install"
+],
+"52c2911e8813": [
+"safe",
+"crontab -l"
+],
+"52f472fdc6da": [
+"safe",
+"base64 -d with a web page address as file"
+],
+"543495bcbf85": [
+"safe",
+"id of a user"
+],
+"54a39a325ae0": [
+"warn",
+"run application jar from target dir"
+],
+"576fc354fdf0": [
+"warn",
+"grep for virtual disk files"
+],
+"57e984612692": [
+"crit",
+"gdb shell escape"
+],
+"5801a8fe0f7a": [
+"crit",
+"openvpn --up runs a shell"
+],
+"582464522857": [
+"warn",
+"grep pattern for database or credential files"
+],
+"5c0ff2870514": [
+"safe",
+"routine service or package helper"
+],
+"5c50600fb49b": [
+"safe",
+"apt install"
+],
+"5cbabf96b597": [
+"warn",
+"[parent] shell started by su from postgres"
+],
+"5d4b2e89aa50": [
+"warn",
+"grep pattern for key or credential files"
+],
+"5e11467f3968": [
+"safe",
+"sshd"
+],
+"5eede07843a5": [
+"safe",
+"apt install"
+],
+"60b57bf414e4": [
+"safe",
+"apt install"
+],
+"60e9585d73b8": [
+"crit",
+"[parent] c89 -wrapper"
+],
+"6123aaa21776": [
+"safe",
+"dockerd untar"
+],
+"613610005f0e": [
+"safe",
+"routine system helper"
+],
+"61816282b15a": [
+"safe",
+"routine service or package helper"
+],
+"61c398eafe7f": [
+"safe",
+"xclip or man"
+],
+"627118e99d63": [
+"safe",
+"edit or view a script"
+],
+"63ace7bdea0c": [
+"safe",
+"routine helper"
+],
+"647828b71847": [
+"warn",
+"grep pattern for session or credential files"
+],
+"654cf2d89522": [
+"safe",
+"apt install"
+],
+"65be2c6bce09": [
+"safe",
+"routine helper"
+],
+"6633a0dabda6": [
+"crit",
+"busybox sh under sudo"
+],
+"67b70e97b6a1": [
+"warn",
+"grep pattern for key or credential files"
+],
+"69a918bcfdbc": [
+"crit",
+"[parent] emacs term shell under sudo"
+],
+"6e76e13f91dc": [
+"warn",
+"grep for docker sockets and compose files"
+],
+"6e8b255d3cef": [
+"warn",
+"cpulimit /bin/ls under sudo"
+],
+"701748cd2bc3": [
+"crit",
+"ruby exec shell"
+],
+"704073e6998c": [
+"crit",
+"nc -e shell"
+],
+"7079120b0aed": [
+"crit",
+"csvtool call shell"
+],
+"70fabd17f8e4": [
+"safe",
+"routine service or package helper"
+],
+"71de857f1d05": [
+"safe",
+"id of a user"
+],
+"71ea2dc4361d": [
+"crit",
+"download elf, chmod +x, run"
+],
+"721d4f3b39c8": [
+"crit",
+"url-encoded host, fetch from github user content"
+],
+"7335bbd335d7": [
+"warn",
+"grep pattern for key or credential files"
+],
+"7528283aa886": [
+"warn",
+"grep pattern for key or credential files"
+],
+"752d0dc3a63e": [
+"warn",
+"grep pattern for key or credential files"
+],
+"773978ebe6af": [
+"warn",
+"dd on syslog"
+],
+"775f7a8cda2b": [
+"safe",
+"apt install"
+],
+"78f3d52c9c23": [
+"safe",
+"routine helper"
+],
+"7cdc223bc6e3": [
+"warn",
+"grep pattern for key or credential files"
+],
+"7dd33c3201e6": [
+"safe",
+"routine system helper"
+],
+"7dd452dae2ce": [
+"warn",
+"sudo composer run-script"
+],
+"7e22e7ea6a71": [
+"crit",
+"sqlite3 .shell"
+],
+"7e87ccd33b22": [
+"safe",
+"routine service or package helper"
+],
+"7f2c07c689e6": [
+"crit",
+"gdb shell escape"
+],
+"7f91afc3fe6a": [
+"safe",
+"emacs or snap advice"
+],
+"7f93ba0ed3e4": [
+"safe",
+"apt install"
+],
+"7fac99e134fe": [
+"safe",
+"routine system helper"
+],
+"800d151c841f": [
+"safe",
+"routine service or package helper"
+],
+"800db53a3f42": [
+"warn",
+"grep pattern for key or credential files"
+],
+"8133503b6a56": [
+"safe",
+"hostname or grep exclusion"
+],
+"834d7a88129d": [
+"crit",
+"find -exec shell"
+],
+"8388436e312a": [
+"safe",
+"grep of sshd settings"
+],
+"849b3669c000": [
+"crit",
+"openvpn --up runs a shell"
+],
+"864abb3798c0": [
+"safe",
+"xclip or man"
+],
+"87d5048a8636": [
+"safe",
+"apt install"
+],
+"88f6c574333e": [
+"safe",
+"split a file"
+],
+"8a4eb71446cf": [
+"warn",
+"grep pattern for key or credential files"
+],
+"8b6769a0c241": [
+"safe",
+"apt gpg temp file"
+],
+"8cafa0cd6542": [
+"safe",
+"cloud metadata fetch"
+],
+"8cc10bd43c96": [
+"warn",
+"remove web shell files"
+],
+"90dadc89633a": [
+"safe",
+"awk print"
+],
+"90ec072bbde5": [
+"crit",
+"aa-exec profile switch with exploit binary"
+],
+"91862bd9d4fc": [
+"safe",
+"apt install"
+],
+"91bd2f2a2be9": [
+"crit",
+"shred /boot"
+],
+"92ea1c08681f": [
+"crit",
+"ncat -c bash"
+],
+"94f4e9bc7805": [
+"crit",
+"gem open runs a shell"
+],
+"953dd2dd48c0": [
+"crit",
+"gdb shell escape"
+],
+"96b273f52abe": [
+"warn",
+"sudo run local script"
+],
+"9706a51487de": [
+"warn",
+"download a script from github"
+],
+"983d4a3b0df2": [
+"safe",
+"routine service or package helper"
+],
+"99e600a097bd": [
+"warn",
+"create /etc/doas.conf"
+],
+"9a78996a184e": [
+"safe",
+"apt install"
+],
+"9a7cdf4e246d": [
+"crit",
+"rpm lua shell"
+],
+"9af731f673d7": [
+"safe",
+"apt install"
+],
+"9be975c69252": [
+"crit",
+"login -f root from telnetd"
+],
+"9cb95e258fc9": [
+"safe",
+"xclip or man"
+],
+"9cc097528b7b": [
+"safe",
+"routine system helper"
+],
+"9dd43e856406": [
+"safe",
+"apt install"
+],
+"9e3378014eec": [
+"safe",
+"groups, users, command-not-found"
+],
+"9fca5dd43915": [
+"safe",
+"base64 with a bad option"
+],
+"a037682a446f": [
+"safe",
+"split a file"
+],
+"a0b316ae8cd8": [
+"crit",
+"echo of base64 elf payload"
+],
+"a0be620eabcc": [
+"safe",
+"run-parts cron.hourly"
+],
+"a23db3d4f922": [
+"crit",
+"mysql shell escape"
+],
+"a24e43563787": [
+"safe",
+"view or edit a file"
+],
+"a3ac7f08ca48": [
+"warn",
+"curl with proxy credentials in argv"
+],
+"a3f777bf841f": [
+"safe",
+"routine system helper"
+],
+"a75389cc4a9c": [
+"warn",
+"grep pattern for key or credential files"
+],
+"a7a7892766b8": [
+"warn",
+"grep pattern for key or credential files"
+],
+"a96eaea56a7e": [
+"crit",
+"script that finds a writable dir and stages there"
+],
+"a9fb2a7c0968": [
+"safe",
+"routine service or package helper"
+],
+"aa2d451fcf2f": [
+"warn",
+"grep pattern for key or credential files"
+],
+"aa3839608457": [
+"crit",
+"[parent] sh -c started by ghostscript"
+],
+"ab53106069b4": [
+"crit",
+"[parent] composer run-script from /tmp"
+],
+"acd911f5301f": [
+"crit",
+"gawk system shell"
+],
+"ad6d108d5d46": [
+"crit",
+"puppet exec shell"
+],
+"ae33c6791372": [
+"warn",
+"ngrok tunnel"
+],
+"af707901bc34": [
+"warn",
+"octave system call under sudo"
+],
+"af805e99816c": [
+"crit",
+"appends script to init/cron files"
+],
+"afdb1840102e": [
+"warn",
+"sudo c89"
+],
+"b0c5fd07afeb": [
+"safe",
+"emacs or snap advice"
+],
+"b2a66a671d6a": [
+"crit",
+"decode to /tmp script, chmod +x, run"
+],
+"b328dc886869": [
+"safe",
+"base64 -d"
+],
+"b344acda5720": [
+"crit",
+"gdrive upload with token on the command line"
+],
+"b3520e5e06af": [
+"warn",
+"read sudoers"
+],
+"b37331b97acc": [
+"crit",
+"sudo -R chroot trick"
+],
+"b3e85a4e3d76": [
+"crit",
+"unload module named rootkit"
+],
+"b478852073c0": [
+"warn",
+"remove web shell files"
+],
+"b52d6ddf7992": [
+"safe",
+"routine system helper"
+],
+"b66286c813a9": [
+"crit",
+"emacs --eval term shell"
+],
+"b734ed05f5eb": [
+"safe",
+"view or edit a file"
+],
+"b7e663f03d8c": [
+"crit",
+"apt pre-invoke shell"
+],
+"b93211e9fd0b": [
+"safe",
+"apt install"
+],
+"b934c0946536": [
+"safe",
+"command-not-found"
+],
+"b9bdadcaba4c": [
+"warn",
+"grep pattern for key or credential files"
+],
+"b9cf232b92c0": [
+"safe",
+"routine service or package helper"
+],
+"bd59f7cf6566": [
+"warn",
+"grep pattern for key or credential files"
+],
+"be3f5c46194d": [
+"safe",
+"apt install"
+],
+"bf5047ec47a9": [
+"warn",
+"download a script from github"
+],
+"bfb9d8a8967a": [
+"safe",
+"routine service or package helper"
+],
+"c0993e802355": [
+"crit",
+"download of a script named docker-privesc"
+],
+"c1ac7081754b": [
+"crit",
+"cpulimit spawns a shell"
+],
+"c1e7965cdf54": [
+"safe",
+"apt install"
+],
+"c2af87ad6c94": [
+"safe",
+"routine service or package helper"
+],
+"c357aa92e318": [
+"crit",
+"curl piped to bash"
+],
+"c40b5065c582": [
+"safe",
+"run-parts cron.hourly"
+],
+"c6d17c893222": [
+"safe",
+"routine system helper"
+],
+"c7f95f1e4ec0": [
+"warn",
+"fetch from raw ip:port"
+],
+"c8f17a257da8": [
+"warn",
+"[parent] su under sudo"
+],
+"c9aa6a144bff": [
+"warn",
+"grep pattern for database or credential files"
+],
+"c9c66c350c14": [
+"warn",
+"grep pattern for key or credential files"
+],
+"ca1237aaa141": [
+"warn",
+"drop_caches under sudo"
+],
+"ca1f7bb4a234": [
+"safe",
+"routine helper"
+],
+"cb731f387be1": [
+"warn",
+"chmod 777 script"
+],
+"cbd20d6849da": [
+"crit",
+"compiler -wrapper to run a program"
+],
+"cf0a1e4b1cb1": [
+"crit",
+"disables history, rmmod, shell"
+],
+"cf1cfe5841a3": [
+"safe",
+"routine helper"
+],
+"d11fd20aff5e": [
+"warn",
+"find group-writable files outside home"
+],
+"d1b25aca73fa": [
+"warn",
+"fetch from raw ip:port"
+],
+"d1e74cc5ae8a": [
+"warn",
+"splunk alert script runner"
+],
+"d31fc65e959b": [
+"safe",
+"apt install"
+],
+"d348997bd716": [
+"safe",
+"wget of a file name"
+],
+"d45680d33c2d": [
+"safe",
+"apt install"
+],
+"d4a6f7c01e10": [
+"safe",
+"routine system helper"
+],
+"d5f7c49541b9": [
+"crit",
+"setcap cap_setuid on a local binary"
+],
+"d619df9ac385": [
+"warn",
+"grep pattern for session or credential files"
+],
+"d8f001a53326": [
+"warn",
+"grep pattern for key or credential files"
+],
+"d980fb6de549": [
+"safe",
+"routine service or package helper"
+],
+"d9de8e79a9c5": [
+"warn",
+"decode from /tmp"
+],
+"daa92271f275": [
+"warn",
+"grep pattern for database or credential files"
+],
+"dbec95b2ec58": [
+"safe",
+"apt install"
+],
+"dbef9d278973": [
+"crit",
+"emacs --eval term shell"
+],
+"dc0aaf4d74c4": [
+"crit",
+"bash /dev/tcp reverse shell"
+],
+"dcbc7611f5a9": [
+"crit",
+"node spawns a shell"
+],
+"dd09bccc031c": [
+"safe",
+"kmod list"
+],
+"de6bdc01c176": [
+"warn",
+"sudo echo of a taunt string"
+],
+"df260651e215": [
+"safe",
+"apt install"
+],
+"df72c1f575f3": [
+"warn",
+"[parent] composer run-script"
+],
+"df809128364a": [
+"safe",
+"routine system helper"
+],
+"e15d73660bd5": [
+"safe",
+"apt install"
+],
+"e1db00447e9a": [
+"safe",
+"routine service or package helper"
+],
+"e1f830710763": [
+"safe",
+"routine system helper"
+],
+"e2ab7634b98c": [
+"crit",
+"setcap cap_setuid on a local binary"
+],
+"e420ea06927e": [
+"safe",
+"read motd cache"
+],
+"e42ed8f5b51c": [
+"crit",
+"awk system shell under sudo"
+],
+"e43531fa7566": [
+"crit",
+"download into hidden dir in /tmp, no cert check"
+],
+"e5228709fd65": [
+"safe",
+"routine service or package helper"
+],
+"e6ad2a086c2c": [
+"safe",
+"routine service or package helper"
+],
+"e732c07a57c4": [
+"crit",
+"ruby exec shell"
+],
+"e9fe7266d8d7": [
+"safe",
+"plain base64"
+],
+"ee21869fcf13": [
+"safe",
+"groups, users, command-not-found"
+],
+"efce43450038": [
+"crit",
+"gdb shell escape"
+],
+"f1c7da6356ca": [
+"warn",
+"[parent] ifconfig from node"
+],
+"f1f6bd10a4e6": [
+"safe",
+"apt install"
+],
+"f30e0cd3c308": [
+"safe",
+"base64 -d"
+],
+"f3c7e46cf265": [
+"safe",
+"groups, users, command-not-found"
+],
+"f4acff72c7fb": [
+"safe",
+"grep .vhd"
+],
+"f4b7b405db03": [
+"crit",
+"binary run from /dev/shm"
+],
+"f4d8ad295c96": [
+"crit",
+"[parent] sh from awk"
+],
+"f6e64f61162b": [
+"warn",
+"grep pattern for key or credential files"
+],
+"f723bfd0031b": [
+"safe",
+"routine system helper"
+],
+"f77e952fb901": [
+"warn",
+"grep pattern for session or credential files"
+],
+"f7e0fbe992a6": [
+"crit",
+"cpulimit spawns a shell"
+],
+"fac1ecf8ce4e": [
+"warn",
+"octave system call under sudo"
+],
+"fb0158dc9505": [
+"crit",
+"decode to /tmp script, chmod +x, run"
+],
+"fb1aa9d38bfe": [
+"warn",
+"copy a file from /tmp"
+],
+"fb4a4fe36e6e": [
+"crit",
+"compiler -wrapper to run a program"
+],
+"fbed4af09cd8": [
+"crit",
+"gdrive upload with token on the command line"
+],
+"fc33117e7bf9": [
+"crit",
+"sqlite3 .shell"
+],
+"fce96b957ab2": [
+"safe",
+"base64 -d"
+],
+"fe72cf194f52": [
+"safe",
+"routine system helper"
+],
+"ff912b40b55d": [
+"crit",
+"[parent] busybox sh under sudo"
+]
+}
+}

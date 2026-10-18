@@ -667,7 +667,7 @@ def test_designated_marks_only_the_scenarios_own_driver_command() -> None:
 
 
 def test_settle_manifest_is_heldout_only() -> None:
-    """E14 fresh families: valid manifest, three-class labels, every family on the held-out side."""
+    """Settle capture fresh families: valid manifest, three-class labels, every family held-out."""
     mf = manifest.load(Path(__file__).parents[1] / "scenarios_settle.toml")
     assert len(mf.scenarios) >= 100
     families = {s.family for s in mf.scenarios}

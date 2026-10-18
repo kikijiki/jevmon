@@ -2,7 +2,7 @@
 #
 # Two uv projects: app/ (daemon, judge, TUI) and lab/ (scenarios, dataset, experiments; depends
 # on app/). Recipes run from the repo root and select the project with `--project`, so relative
-# paths such as models/, lab-data/, runs/ and lab/scenarios.toml stay root-relative.
+# paths such as models/, lab-data/ and lab/scenarios.toml stay root-relative.
 
 default:
     @just --list
@@ -42,6 +42,54 @@ run *ARGS: sync
 run-lab *ARGS: sync-lab
     uv run --project lab {{ARGS}}
 
+# build the root exec helper (app/helper/, nix) into app/helper/result
+exec-build:
+    nix build .#jevmon-exec -o app/helper/result
+
+# check the helper's BPF program in a throwaway NixOS VM (qemu, needs /dev/kvm; no root on the host)
+exec-vmtest:
+    nix build .#nixosConfigurations.exec-vmtest.config.system.build.vm -o /tmp/jevmon-vmtest
+    rm -rf /tmp/jevmon-vmtest-out && mkdir -p /tmp/jevmon-vmtest-out
+    cd /tmp && env -u LD_LIBRARY_PATH QEMU_OPTS="-virtfs local,path=/tmp/jevmon-vmtest-out,mount_tag=out,security_model=none" NIX_DISK_IMAGE=/tmp/jevmon-vmtest.qcow2 timeout 300 /tmp/jevmon-vmtest/bin/run-nixos-vm > /tmp/jevmon-vmtest-out/console.log 2>&1 || true
+    @echo "--- guest ---"; cat /tmp/jevmon-vmtest-out/guest.txt /tmp/jevmon-vmtest-out/helper.err 2>&1 | tail -20
+    @echo "exec records: $(grep -c '"t":"exec"' /tmp/jevmon-vmtest-out/dump.ndjson 2>/dev/null)"
+
+# run the root helper alone for N seconds and print a summary (one sudo; raw lines in $TMPDIR/jevmon-exec-trace.ndjson)
+exec-trace N="10": exec-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out="${TMPDIR:-/tmp}/jevmon-exec-trace.ndjson"
+    : > "$out"
+    bin="$(readlink -f app/helper/result/bin/jevmon-exec)"
+    sudo systemd-run --pipe --wait --quiet --collect \
+        --property=AmbientCapabilities="CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE" \
+        --property=CapabilityBoundingSet="CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE" \
+        --property=PrivateNetwork=yes --property=ProtectSystem=strict --property=ProtectHome=read-only \
+        --property=LimitMEMLOCK=infinity --property=ReadWritePaths="$(dirname "$out")" \
+        "$bin" --uid "$(id -u)" --socket "" --duration {{N}} --dump "$out" 2> "$out.summary" || true
+    cat "$out.summary"
+    echo "exec lines: $(grep -c '"t":"exec"' "$out" || true)  (raw: $out)"
+
+# install the helper as a persistent system service that starts at boot (sudo); `jevmon start` does not need this
+exec-install: exec-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bin="$(readlink -f app/helper/result/bin/jevmon-exec)"
+    sudo ln -sfn "$bin" /nix/var/nix/gcroots/jevmon-exec
+    sed -e "s|@HELPER@|$bin|" -e "s|@UID@|$(id -u)|" -e "s|@REPO@|$PWD|" app/contrib/jevmon-exec.service \
+        | sudo tee /etc/systemd/system/jevmon-exec.service > /dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl enable jevmon-exec.service
+    sudo systemctl restart jevmon-exec.service
+    sleep 1
+    uv run --project app jevmon status
+
+# stop and remove the persistent helper service
+exec-uninstall:
+    -sudo systemctl disable --now jevmon-exec.service
+    sudo rm -f /etc/systemd/system/jevmon-exec.service /nix/var/nix/gcroots/jevmon-exec
+    sudo systemctl daemon-reload
+
 # run the tier-0 /proc exec source; pass args through, e.g. `just exec --once`
 exec *ARGS: sync
     uv run --project app jevmon exec {{ARGS}}
@@ -78,7 +126,7 @@ screenshots: sync
 gpu-sync:
     VIRTUAL_ENV=$PWD/app/.venv-gpu uv sync --project app --active --group gpu --no-group cpu
 
-# create/refresh lab/.venv-gpu (lab experiments, trackio, ../app editable) from lab/uv.lock
+# create/refresh lab/.venv-gpu (lab experiments, ../app editable) from lab/uv.lock
 gpu-sync-lab:
     VIRTUAL_ENV=$PWD/lab/.venv-gpu uv sync --project lab --active --group gpu --no-group cpu
 
@@ -117,7 +165,7 @@ daemon-stop:
 daemon-restart:
     systemctl --user restart jevmond.service
 
-# systemd state plus the daemon's own status (model, poller, counters)
+# systemd state plus the daemon's own status (model, exec source, counters)
 daemon-status:
     -systemctl --user status jevmond.service --no-pager --lines 0
     uv run --project app jevmon ctl status
@@ -145,30 +193,26 @@ lab: sync-lab lab-build
 lab-report: sync-lab
     uv run --project lab jevmon-lab report --in lab-data --judge laya
 
-# --- experiment dashboard (Trackio, local only): runs/ store written by lab/scripts/ ----------------
-# Runs are tracked by lab/scripts/finetune_head.py, finetune_laya.py and sweep_zero_shot.py through
-# jevmon_lab.runlog (a no-op without trackio, which lives in the lab env). The dashboard binds
-# 127.0.0.1:7861 (fixed port); nothing is synced anywhere.
+# draw docs/screenshots/learning.png: held-out macro-F1 of the three shipped heads against the
+# number of training families (CPU, a few minutes; installs the optional `plots` extra)
+learning-curve:
+    uv run --project lab --extra plots python lab/scripts/learning_curve.py
+
+# --- experiment dashboard (Trackio, local only): the runs/ store written by lab/scripts/ ---------
+# lab/scripts/lora_check.py tracks every LoRA run through jevmon_lab.runlog: project `jevmon-lora`,
+# one run per selection cell and final seed. Trackio is the optional lab extra `trackio`; without it
+# the run still writes <out>/metrics.jsonl. The dashboard binds 127.0.0.1:7861 (fixed port) and
+# nothing is synced anywhere. TRACKIO_DIR picks the store, so a pod sync is viewable with e.g.
+# `TRACKIO_DIR=$PWD/trackio-runs just runs` (see lab/README.md).
 
 # dashboard in the foreground on http://127.0.0.1:7861 (Ctrl-C stops it)
 runs:
-    mkdir -p runs
-    TRACKIO_DIR=$PWD/runs GRADIO_SERVER_NAME=127.0.0.1 GRADIO_SERVER_PORT=7861 GRADIO_NUM_PORTS=1 GRADIO_SHARE=false GRADIO_ANALYTICS_ENABLED=False HF_HUB_DISABLE_TELEMETRY=1 BROWSER=true lab/.venv-gpu/bin/trackio show --host 127.0.0.1 --no-footer
+    mkdir -p "${TRACKIO_DIR:-runs}"
+    TRACKIO_DIR="${TRACKIO_DIR:-$PWD/runs}" GRADIO_SERVER_NAME=127.0.0.1 GRADIO_SERVER_PORT=7861 GRADIO_NUM_PORTS=1 GRADIO_SHARE=false GRADIO_ANALYTICS_ENABLED=False HF_HUB_DISABLE_TELEMETRY=1 BROWSER=true uv run --project lab --extra trackio trackio show --host 127.0.0.1 --no-footer
 
-# add ONE tailnet-only route: https://<this host>:8443/ -> 127.0.0.1:7861 (own port, not funnel)
-runs-serve:
-    tailscale serve --bg --https=8443 http://127.0.0.1:7861
+# list the Trackio projects, then the runs of the LoRA project (no dashboard)
+runs-list:
+    TRACKIO_DIR="${TRACKIO_DIR:-$PWD/runs}" uv run --project lab --extra trackio trackio list projects
+    TRACKIO_DIR="${TRACKIO_DIR:-$PWD/runs}" uv run --project lab --extra trackio trackio list runs --project jevmon-lora
 
-# remove only that route (the rest of the tailscale serve config is untouched)
-runs-unserve:
-    tailscale serve --https=8443 off
 
-# detached dashboard (survives this shell; log and pid under runs/), then `just runs-stop`
-runs-start:
-    mkdir -p runs
-    TRACKIO_DIR=$PWD/runs GRADIO_SERVER_NAME=127.0.0.1 GRADIO_SERVER_PORT=7861 GRADIO_NUM_PORTS=1 GRADIO_SHARE=false GRADIO_ANALYTICS_ENABLED=False HF_HUB_DISABLE_TELEMETRY=1 BROWSER=true setsid nohup lab/.venv-gpu/bin/trackio show --host 127.0.0.1 --no-footer > runs/dashboard.log 2>&1 < /dev/null & echo $! > runs/dashboard.pid
-
-# stop the detached dashboard (pid file) and remove the 8443 tailnet route
-runs-stop:
-    -test -f runs/dashboard.pid && kill $(cat runs/dashboard.pid) && rm -f runs/dashboard.pid
-    -tailscale serve --https=8443 off

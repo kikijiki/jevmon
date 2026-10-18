@@ -122,3 +122,45 @@ def test_build_decider_wires_device_and_dtype_from_judge_config(tmp_path):
     path.write_text("[judge]\ndevice = 'gpu'\ndtype = 'fp16'\n")
     decider = build_decider(load_config(path))
     assert (decider.config.device, decider.config.dtype) == ("gpu", "fp16")
+
+
+def link_exe(root: Path, pid: int, target: str) -> None:
+    link = root / str(pid) / "exe"
+    link.unlink(missing_ok=True)
+    link.symlink_to(target)
+
+
+def test_allowed_launch_is_counted_not_judged_and_stored_only_on_request(tmp_path):
+    root = tmp_path / "proc"
+    write_proc(root, 100, ["/bin/sleep", "9"])
+    write_proc(root, 101, ["/bin/other", "x"])
+    link_exe(root, 100, "/bin/sleep")
+    link_exe(root, 101, "/bin/other")
+    for store_skipped in (False, True):
+        path = tmp_path / f"c{store_skipped}.toml"
+        path.write_text(
+            f'[filter]\nallow = ["sleep *"]\nstore_skipped = {str(store_skipped).lower()}\n'
+        )
+        store = SqliteStore(tmp_path / f"e{store_skipped}.db")
+        decider = FakeDecider()
+        monitor = Monitor(load_config(path), store, proc_root=str(root), decider=decider)
+        monitor.start()
+        try:
+            assert wait_for(lambda m=monitor: m.status()["allow_skipped"] >= 1)
+            assert wait_for(lambda d=decider: d.calls >= 1)
+            status = monitor.status()
+            assert status["allow_hits"] == {"sleep *": status["allow_skipped"]}
+            rows = [e for _, e, _ in store.query_events(limit=100)]
+            unjudged = [e for e in rows if e.fields.get("reason") == "allow"]
+            if store_skipped:
+                assert wait_for(
+                    lambda st=store: any(
+                        e.fields.get("reason") == "allow" and e.fields.get("judged") == 0
+                        for _, e, _ in st.query_events(limit=100)
+                    )
+                )
+            else:
+                assert not unjudged
+        finally:
+            monitor.stop()
+            store.close()

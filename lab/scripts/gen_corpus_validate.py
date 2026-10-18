@@ -13,6 +13,7 @@ from collections import Counter
 from dataclasses import dataclass
 
 from gen_corpus_lib import (
+    CLASS_DESCRIPTIONS,
     LABELS,
     LLMClient,
     extract_json,
@@ -104,18 +105,13 @@ def attach_facts(rows: list[dict], seed: int = 0) -> None:
 # --------------------------------------------------------------------------------- QA (second pass)
 
 QA_SYSTEM = (
-    "You are a security triage analyst labelling a single process launch. You see only the "
-    "launch itself, not its intended training label. Answer with one word."
+    "You are a security triage analyst labelling a single process launch on a Linux workstation. "
+    "You see only the launch itself, not its intended training label, and you know nothing about "
+    "what the process does afterwards. Answer from the launch text alone."
 )
-QA_CATEGORIES = {
-    "safe": "expected everyday activity: shells, builds, package installs, scheduled jobs, ssh "
-    "sessions and other development tooling; no action needed",
-    "warn": "out of the ordinary but plausibly harmless: a one-off script, the first run of a "
-    "newly installed tool, a debugger; worth a glance",
-    "crit": "looks hostile from the launch alone: downloading and running remote code, encoded "
-    "or obfuscated commands, execution from a temporary/world-writable/hidden location, a shell "
-    "spawned by an unexpected parent",
-}
+# The canonical class descriptions: the blind pass, the generator and the hosted judge must
+# read the classes the same way (gen_corpus_lib.CLASS_DESCRIPTIONS).
+QA_CATEGORIES = CLASS_DESCRIPTIONS
 
 
 def render_qa_text(row: dict) -> str:

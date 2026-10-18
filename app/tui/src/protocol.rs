@@ -1,4 +1,4 @@
-//! The jevmond wire protocol, version 2: newline-delimited JSON over a Unix domain socket.
+//! The jevmond wire protocol, version 5: newline-delimited JSON over a Unix domain socket.
 //!
 //! This module speaks exactly what `src/jevmon/daemon/protocol.py` defines. Outgoing requests
 //! carry only the fields the server accepts (it rejects unknown ones); incoming messages are
@@ -11,7 +11,7 @@ use std::fmt;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 /// Bytes of one request line (mirrors the server).
 pub const MAX_LINE: usize = 131_072;
 /// Bytes of one reply line the client will read.
@@ -51,6 +51,11 @@ pub struct EventPayload {
     /// The short redacted command line (`basename args...`); empty from an older daemon.
     #[serde(default)]
     pub command: String,
+    /// The exe path the daemon matched on, and the redacted space-joined argv (argv[0] first).
+    #[serde(default)]
+    pub exe: String,
+    #[serde(default)]
+    pub argv: String,
     #[serde(default)]
     pub context: String,
     #[serde(default)]
@@ -134,6 +139,28 @@ pub struct Stats {
     pub config: String,
     #[serde(default)]
     pub running: bool,
+    #[serde(default)]
+    pub allow_rules: u64,
+    #[serde(default)]
+    pub allow_skipped: u64,
+    /// "ebpf", "proc" or "replay" (empty from an older daemon).
+    #[serde(default)]
+    pub exec_source: String,
+    /// Non-empty while the ebpf source has no helper: shown in the header.
+    #[serde(default)]
+    pub exec_error: String,
+    #[serde(default)]
+    pub exec_notes: String,
+    #[serde(default)]
+    pub exec_per_s: f64,
+    #[serde(default)]
+    pub exec_lost: u64,
+}
+
+impl Stats {
+    pub fn is_ebpf(&self) -> bool {
+        self.exec_source == "ebpf"
+    }
 }
 
 /// One decoded line from the daemon.
@@ -253,6 +280,10 @@ pub fn ack_request(id: u64, event_id: u64) -> Value {
     request(id, "ack", json!({"event_id": event_id}))
 }
 
+pub fn allow_add_request(id: u64, rule: &str) -> Value {
+    request(id, "allow_add", json!({"rule": rule}))
+}
+
 pub fn pause_request(id: u64) -> Value {
     request(id, "pause", json!({}))
 }
@@ -301,7 +332,17 @@ mod tests {
         assert_eq!(obj["type"], "label");
         assert_eq!(obj["id"], 7);
         assert_eq!(obj["event_id"], 42);
-        assert_eq!(obj["v"], 4);
+        assert_eq!(obj["v"], 5);
+    }
+
+    #[test]
+    fn allow_add_request_has_only_server_accepted_fields() {
+        let req = allow_add_request(3, "/usr/bin/git status *");
+        let obj = req.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["id", "rule", "type", "v"]);
+        assert_eq!(obj["type"], "allow_add");
     }
 
     #[test]
@@ -337,7 +378,7 @@ mod tests {
 
     #[test]
     fn parses_ok_and_error_responses() {
-        let ok = parse_line(br#"{"v":4,"id":7,"ok":true,"result":{"x":1}}"#).unwrap();
+        let ok = parse_line(br#"{"v":5,"id":7,"ok":true,"result":{"x":1}}"#).unwrap();
         match ok {
             Message::Response { id, ok, result, .. } => {
                 assert_eq!(id, Some(7));
@@ -346,7 +387,7 @@ mod tests {
             }
             other => panic!("wrong message: {other:?}"),
         }
-        let err = parse_line(br#"{"v":4,"id":7,"ok":false,"error":"nope"}"#).unwrap();
+        let err = parse_line(br#"{"v":5,"id":7,"ok":false,"error":"nope"}"#).unwrap();
         match err {
             Message::Response { ok, error, .. } => {
                 assert!(!ok);
@@ -356,7 +397,7 @@ mod tests {
         }
     }
 
-    const EVENT_LINE: &[u8] = br#"{"v":4,"stream":"event","event":{"id":3,"time":1.5,"source":"exec","subject":"7","kind":"verdict","severity":2,"message":"m","context":"c","verdict":"model: crit 0.90","class":"crit","confidence":0.9,"probabilities":{"crit":0.9,"safe":0.1},"judged":true,"cached":false,"available":true,"label":null,"labels":[],"acked":false,"future_field":"ignored"}}"#;
+    const EVENT_LINE: &[u8] = br#"{"v":5,"stream":"event","event":{"id":3,"time":1.5,"source":"exec","subject":"7","kind":"verdict","severity":2,"message":"m","context":"c","verdict":"model: crit 0.90","class":"crit","confidence":0.9,"probabilities":{"crit":0.9,"safe":0.1},"judged":true,"cached":false,"available":true,"label":null,"labels":[],"acked":false,"future_field":"ignored"}}"#;
 
     #[test]
     fn parses_stream_event_tolerating_unknown_fields() {
@@ -385,7 +426,7 @@ mod tests {
 
     #[test]
     fn tolerates_missing_optional_fields_with_defaults() {
-        let msg = parse_line(br#"{"v":4,"stream":"event","event":{"id":9,"time":2.0}}"#).unwrap();
+        let msg = parse_line(br#"{"v":5,"stream":"event","event":{"id":9,"time":2.0}}"#).unwrap();
         match msg {
             Message::Event(e) => {
                 assert_eq!(e.id, 9);
@@ -399,7 +440,7 @@ mod tests {
 
     #[test]
     fn parses_stats_and_ready_and_unknown_streams() {
-        match parse_line(br#"{"v":4,"stream":"stats","stats":{"uptime":5.0,"paused":true}}"#)
+        match parse_line(br#"{"v":5,"stream":"stats","stats":{"uptime":5.0,"paused":true}}"#)
             .unwrap()
         {
             Message::Stats(s) => {
@@ -410,18 +451,18 @@ mod tests {
             other => panic!("wrong message: {other:?}"),
         }
         assert_eq!(
-            parse_line(br#"{"v":4,"stream":"ready"}"#).unwrap(),
+            parse_line(br#"{"v":5,"stream":"ready"}"#).unwrap(),
             Message::Ready
         );
         assert_eq!(
-            parse_line(br#"{"v":4,"stream":"telemetry"}"#).unwrap(),
+            parse_line(br#"{"v":5,"stream":"telemetry"}"#).unwrap(),
             Message::UnknownStream
         );
     }
 
     #[test]
     fn parses_command_and_class_and_tolerates_their_absence() {
-        let line = br#"{"v":4,"stream":"event","event":{"id":1,"time":1.0,"command":"curl -s x","class":"warn"}}"#;
+        let line = br#"{"v":5,"stream":"event","event":{"id":1,"time":1.0,"command":"curl -s x","class":"warn"}}"#;
         match parse_line(line).unwrap() {
             Message::Event(e) => {
                 assert_eq!(e.command, "curl -s x");
@@ -429,7 +470,7 @@ mod tests {
             }
             other => panic!("wrong message: {other:?}"),
         }
-        match parse_line(br#"{"v":4,"stream":"event","event":{"id":1,"time":1.0}}"#).unwrap() {
+        match parse_line(br#"{"v":5,"stream":"event","event":{"id":1,"time":1.0}}"#).unwrap() {
             Message::Event(e) => assert_eq!(e.class, ""),
             other => panic!("wrong message: {other:?}"),
         }
@@ -442,13 +483,13 @@ mod tests {
 
     #[test]
     fn probabilities_may_come_as_a_json_string() {
-        let line = br#"{"v":4,"stream":"event","event":{"id":1,"time":1.0,"probabilities":"{\"a\":0.5}"}}"#;
+        let line = br#"{"v":5,"stream":"event","event":{"id":1,"time":1.0,"probabilities":"{\"a\":0.5}"}}"#;
         match parse_line(line).unwrap() {
             Message::Event(e) => assert_eq!(e.probabilities["a"], 0.5),
             other => panic!("wrong message: {other:?}"),
         }
         let junk =
-            br#"{"v":4,"stream":"event","event":{"id":1,"time":1.0,"probabilities":"nope"}}"#;
+            br#"{"v":5,"stream":"event","event":{"id":1,"time":1.0,"probabilities":"nope"}}"#;
         match parse_line(junk).unwrap() {
             Message::Event(e) => assert!(e.probabilities.is_empty()),
             other => panic!("wrong message: {other:?}"),

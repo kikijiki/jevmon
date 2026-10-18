@@ -70,9 +70,13 @@ class LayaConfig:
     device: str = "auto"  # "auto" (GPU when a HIP device works) | "cpu" | "gpu"
     dtype: str = "auto"  # "auto" (laya's per-device default) | "fp32" | "fp16" | "bf16"
     pass_size: int = 0  # states per forward pass; 0 = auto: PASS_SIZE, GPU_PASS_SIZE on the GPU
-    # Path to a fine-tuned head (`jevmon.laya.head.TunedHead`, trained by lab/scripts/finetune_head).
+    # Path to a fine-tuned head (`jevmon.laya.head.TunedHead`, trained by lab/scripts/train_heads.py).
     # Empty = the zero-shot model decides. Load-time, like device/dtype.
     tuned: str = ""
+    # Path or shipped bare name of a LoRA adapter package (`jevmon.laya.head.LoraHead`, e.g.
+    # "laya-lora"): its A/B tensors are merged into the Laya encoder at load and its bundled
+    # classifier head answers in place of `tuned`. Empty = no adapter. Load-time.
+    lora: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +115,7 @@ class LayaDecider:
         self._head = None  # TunedHead when [judge] tuned loaded one; None = zero-shot
         self._embed = None  # the laya embedder feeding the head
         self._tuned_note: str | None = None  # why the configured head is not in use
+        self._lora_note: str | None = None  # why a configured LoRA adapter is not in use
         self._checkpoint = self.config.checkpoint  # effective checkpoint name (see _register)
         self._checkpoint_note: str | None = None  # why checkpoint_dir is not in use
 
@@ -272,6 +277,43 @@ class LayaDecider:
             self._active_device, self._active_dtype, self._device_note = active, dtype, note
             return router
 
+    def _load_lora(self) -> None:
+        """Merge the configured LoRA adapter into the resident encoder and adopt its head.
+
+        Runs before `_load_tuned`: the adapter changes the encoder, and `tuned` (if set) then only
+        replaces the classifier head over the merged features. A missing, malformed or mismatched
+        adapter degrades to the zero-shot path and records why in `_lora_note` (shown by `status`),
+        so a bad path never takes the judge down. No `peft` at runtime: `merge_lora_` folds the
+        adapter into the weights in memory and the module is not kept.
+        """
+        if not self.config.lora:
+            return
+        try:
+            from jevmon.laya.head import HeadLoadError, LoraHead, make_embedder, merge_lora_
+
+            lora = LoraHead.load(self.config.lora)
+            if set(lora.head.labels) != set(self.config.categories):
+                raise HeadLoadError(
+                    f"lora head categories {sorted(lora.head.labels)} != "
+                    f"configured {sorted(self.config.categories)}"
+                )
+            agent = self._agent(self._router)
+            if agent is None:
+                raise HeadLoadError("no loaded agent to merge the lora adapter into")
+            merged = merge_lora_(agent.model.encoder, lora)
+            if merged != len(lora.adapter):
+                raise HeadLoadError(f"merged {merged} of {len(lora.adapter)} lora targets")
+            self._embed = make_embedder(
+                agent, pooling=lora.head.pooling, max_length=lora.head.max_length
+            )
+            self._head, self._lora_note = lora.head, None
+        except Exception as exc:  # noqa: BLE001 - a bad adapter must not take the judge down
+            self._head, self._embed = None, None
+            self._lora_note = (
+                f"lora adapter failed ({type(exc).__name__}: {shorten(str(exc), 120)}); "
+                "zero-shot model"
+            )
+
     def _load_tuned(self) -> None:
         """Load the configured fine-tuned head next to the resident checkpoint.
 
@@ -309,6 +351,7 @@ class LayaDecider:
         except Exception as exc:  # noqa: BLE001 - the model is optional; degrade, do not crash
             self._error = f"{type(exc).__name__}: {exc}"
             return
+        self._load_lora()
         self._load_tuned()
 
     def load(self) -> None:
@@ -358,14 +401,18 @@ class LayaDecider:
 
     @property
     def _tuned_status(self) -> str:
-        """What `[judge] tuned`/`checkpoint_dir` are doing: loaded, off, or why not."""
+        """What `[judge] lora`/`tuned`/`checkpoint_dir` are doing: loaded, off, or why not."""
         if self._checkpoint_note:
             return f"; {self._checkpoint_note}"
+        if self._lora_note:
+            return f"; {self._lora_note}"
         if self._tuned_note:
             return f"; {self._tuned_note}"
         if self._head is not None:
-            name = self.config.tuned.rsplit("/", 1)[-1]
-            return f"; tuned head ({name})"
+            source = self.config.tuned or self.config.lora
+            name = source.rsplit("/", 1)[-1]
+            kind = "lora" if self.config.lora and not self.config.tuned else "tuned head"
+            return f"; {kind} ({name})"
         if self.config.checkpoint_dir and self._checkpoint != LayaConfig().checkpoint:
             return f"; checkpoint {self._checkpoint}"
         return ""

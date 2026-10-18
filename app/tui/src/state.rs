@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
 
+use crate::allow::Chooser;
 use crate::client::DaemonMsg;
 use crate::list::ListState;
 use crate::protocol::{EventPayload, MAX_LABEL, MAX_TEXT, Stats};
@@ -134,14 +135,19 @@ impl Metrics {
         push_sample(&mut self.hist_rate, (self.rate * 100.0).round() as u64);
         push_sample(&mut self.hist_depth, stats.queue_depth);
         push_sample(&mut self.hist_age, stats.queue_age.max(0.0) as u64);
-        push_sample(
-            &mut self.hist_interval,
-            (stats.effective_interval.max(0.0) * 1_000.0) as u64,
-        );
-        push_sample(
-            &mut self.hist_miss,
-            (stats.miss_ratio.clamp(0.0, 1.0) * 1_000.0) as u64,
-        );
+        if stats.is_ebpf() {
+            push_sample(&mut self.hist_interval, stats.exec_per_s.max(0.0) as u64);
+            push_sample(&mut self.hist_miss, stats.exec_lost);
+        } else {
+            push_sample(
+                &mut self.hist_interval,
+                (stats.effective_interval.max(0.0) * 1_000.0) as u64,
+            );
+            push_sample(
+                &mut self.hist_miss,
+                (stats.miss_ratio.clamp(0.0, 1.0) * 1_000.0) as u64,
+            );
+        }
         self.stats = Some(stats);
     }
 
@@ -183,6 +189,8 @@ pub struct App {
     pub focus: Focus,
     pub layout: LayoutMode,
     pub help: bool,
+    /// The allow-rule chooser, open over the selected event.
+    pub chooser: Option<Chooser>,
     pub detail_offset: usize,
     /// Rows visible in the detail pane (set by the renderer; used for page scrolls).
     pub detail_viewport: usize,
@@ -208,6 +216,7 @@ impl App {
             focus: Focus::List,
             layout: LayoutMode::Below,
             help: false,
+            chooser: None,
             detail_offset: 0,
             detail_viewport: 10,
             list_rows: None,
@@ -250,6 +259,18 @@ impl App {
             DaemonMsg::Event(event) => self.ingest(event),
             DaemonMsg::Stats(stats) => self.metrics.on_stats(stats),
             DaemonMsg::Labeled(event) => self.ingest(event),
+            DaemonMsg::AllowAdded {
+                rule,
+                count,
+                changed,
+            } => {
+                let rule = sanitize::clean(&rule, 120);
+                self.flash(if changed {
+                    format!("allowed: {rule} ({count} rules)")
+                } else {
+                    format!("already allowed ({count} rules)")
+                });
+            }
             DaemonMsg::Failed(reason) => {
                 self.flash(format!("daemon: {}", sanitize::clean(&reason, 200)))
             }
@@ -385,6 +406,9 @@ impl App {
             self.handle_filter_key(key);
             return Vec::new();
         }
+        if self.chooser.is_some() {
+            return self.handle_chooser_key(key);
+        }
         if self.help {
             match key.code {
                 KeyCode::Char('?') | KeyCode::Esc => self.help = false,
@@ -411,6 +435,10 @@ impl App {
             KeyCode::Char('t') => self.label_selected("true-positive"),
             KeyCode::Char('f') => self.label_selected("false-positive"),
             KeyCode::Char('y') => self.ack_selected(),
+            KeyCode::Char('a') => {
+                self.open_chooser();
+                Vec::new()
+            }
             KeyCode::Char('p') => self.toggle_pause(),
             KeyCode::Char('/') => {
                 self.open_filter();
@@ -614,6 +642,44 @@ impl App {
         }
     }
 
+    /// Open the allow-rule chooser for the selected event (the detail pane must be showing).
+    fn open_chooser(&mut self) {
+        if self.layout == LayoutMode::Hidden {
+            self.flash("open the detail pane (d) to allow a launch");
+            return;
+        }
+        let Some(event) = self.selected_event() else {
+            self.flash("no event selected");
+            return;
+        };
+        match Chooser::new(event.id, &event.exe, &event.argv) {
+            Ok(chooser) => self.chooser = Some(chooser),
+            Err(reason) => self.flash(reason),
+        }
+    }
+
+    fn handle_chooser_key(&mut self, key: KeyEvent) -> Vec<Cmd> {
+        let Some(chooser) = self.chooser.as_mut() else {
+            return Vec::new();
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.chooser = None,
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => chooser.move_scope(-1),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => chooser.move_scope(1),
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('-') => chooser.adjust_k(-1),
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('+') | KeyCode::Char('=') => {
+                chooser.adjust_k(1)
+            }
+            KeyCode::Enter => {
+                let rule = chooser.rule();
+                self.chooser = None;
+                return vec![Cmd::AllowAdd { rule }];
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
     fn toggle_pause(&mut self) -> Vec<Cmd> {
         if self.metrics.paused() {
             vec![Cmd::Resume]
@@ -641,6 +707,8 @@ pub fn sanitize_event(event: &mut EventPayload) {
     event.kind = sanitize::clean(&event.kind, 64);
     event.message = sanitize::clean(&event.message, sanitize::DEFAULT_LIMIT);
     event.command = sanitize::clean(&event.command, sanitize::DEFAULT_LIMIT);
+    event.exe = sanitize::clean(&event.exe, sanitize::DEFAULT_LIMIT);
+    event.argv = sanitize::clean(&event.argv, sanitize::DEFAULT_LIMIT);
     // The context keeps its line structure: it is a document, not a caption.
     event.context = sanitize::clean_lines(&event.context, sanitize::DEFAULT_LIMIT);
     event.verdict = sanitize::clean(&event.verdict, 256);

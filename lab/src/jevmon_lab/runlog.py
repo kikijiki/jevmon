@@ -1,22 +1,31 @@
-"""Local-only experiment tracking for the lab scripts, a no-op without `trackio`.
+"""Local-only experiment tracking for the lab scripts, plus an always-on JSONL mirror.
 
 `RunLog` wraps Trackio (Hugging Face's lightweight tracker: a local SQLite store plus a
 dashboard) behind four calls - `start`, `log`, `table`, `finish` - so the training and eval
-scripts can report live progress. Trackio is a dependency of the lab project only; when it is
-not importable every call is a silent no-op, so the app, its tests and the daemon never need it.
+scripts can report live progress.
 
-Nothing leaves the machine: before Trackio is imported this module points its store at a
-local directory and clears every setting that would sync a run (Space, server URL, bucket,
-dataset, webhook, share link, telemetry). Trackio itself has no telemetry; the Gradio and
-Hugging Face switches are set anyway as a belt-and-braces measure.
+Two independent sinks, so a run is observable either way:
+
+- Trackio, an OPTIONAL lab extra (`uv run --project lab --extra trackio ...`). When it is not
+  importable every Trackio call is a silent no-op and the run continues.
+- A JSONL file (`jsonl=<path>`), always written if a path is given, with the same records, so
+  `<out>/metrics.jsonl` is a complete log even without the extra.
+
+Nothing leaves the machine: before Trackio is imported this module points its store at a local
+directory (`TRACKIO_DIR`) and clears every setting that would sync a run (Space, server URL,
+bucket, dataset, webhook, share link, telemetry). Trackio itself has no telemetry; the Gradio
+and Hugging Face switches are set anyway as a belt-and-braces measure.
 """
 
 import importlib
+import json
 import os
 import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Protocol
+
+from jevmon_lab.manifest import LABELS
 
 DEFAULT_DIR = Path("runs")
 
@@ -108,14 +117,37 @@ def _plain(value: Any) -> Any:
 
 
 class RunLog:
-    """One tracked run. Build it with `RunLog.start`; every method is safe to call blind."""
+    """One tracked run. Build it with `RunLog.start`; every method is safe to call blind.
 
-    def __init__(self, backend: Backend | None) -> None:
+    `enabled` reports whether Trackio is recording; the JSONL mirror is written whenever
+    `jsonl` was passed, independently of Trackio.
+    """
+
+    def __init__(
+        self,
+        backend: Backend | None,
+        jsonl: Path | None = None,
+        *,
+        project: str = "",
+        name: str = "",
+    ) -> None:
         self._backend = backend
+        self._project = project
+        self._name = name
+        self._jsonl = None
+        if jsonl is not None:
+            jsonl = Path(jsonl)
+            jsonl.parent.mkdir(parents=True, exist_ok=True)
+            self._jsonl = jsonl.open("a", encoding="utf-8")
 
     @property
     def enabled(self) -> bool:
         return self._backend is not None
+
+    @property
+    def recording(self) -> bool:
+        """True when either sink is live (Trackio or the JSONL mirror)."""
+        return self._backend is not None or self._jsonl is not None
 
     @classmethod
     def start(
@@ -125,43 +157,66 @@ class RunLog:
         config: Mapping[str, Any] | None = None,
         *,
         directory: Path = DEFAULT_DIR,
+        jsonl: Path | None = None,
         backend: Backend | None = None,
         enabled: bool = True,
     ) -> "RunLog":
         """Begin a run under `directory/`; disabled (or without trackio) it is a no-op.
 
         `backend` replaces Trackio (tests). A tracker that fails to start never stops the
-        experiment: the failure is reported on stderr and tracking is off for the run.
+        experiment: the failure is reported on stderr and Trackio is off for the run. The
+        JSONL mirror, if `jsonl` is given, is written regardless.
         """
-        if not enabled:
-            return cls(None)
-        if backend is None:
+        plain_config = _plain(dict(config or {}))
+        if enabled and backend is None:
             directory.mkdir(parents=True, exist_ok=True)
             backend = _load_trackio(directory)
             if backend is None:
-                print("runlog: trackio not installed, tracking off", file=sys.stderr)
-                return cls(None)
-        try:
-            backend.init(project, name, _plain(dict(config or {})))
-        except Exception as exc:  # noqa: BLE001 - a broken tracker must not stop the run
-            print(f"runlog: tracking off ({exc})", file=sys.stderr)
-            return cls(None)
-        return cls(backend)
+                print(
+                    "runlog: trackio not installed, tracking off (JSONL mirror only)",
+                    file=sys.stderr,
+                )
+        run = cls(backend if enabled else None, jsonl, project=project, name=name)
+        if run._backend is not None:
+            try:
+                run._backend.init(project, name, plain_config)
+            except Exception as exc:  # noqa: BLE001 - a broken tracker must not stop the run
+                print(f"runlog: tracking off ({exc})", file=sys.stderr)
+                run._backend = None
+        run._emit({"kind": "config", "config": plain_config})
+        return run
 
     def log(self, step: int, **scalars: float | str | bool) -> None:
         """Record `scalars` at `step`; `/` in a name groups plots in the dashboard."""
-        if self._backend is not None and scalars:
-            self._guard(lambda b: b.log(dict(scalars), step))
+        if not scalars:
+            return
+        self._emit({"kind": "scalar", "step": int(step), "metrics": scalars})
+        if self._backend is not None:
+            self._guard(lambda b: b.log(dict(scalars), int(step)))
 
     def table(self, name: str, rows: list[dict[str, Any]], step: int = 0) -> None:
         """Record `rows` (dicts sharing keys) as a table named `name`."""
-        if self._backend is not None and rows:
-            self._guard(lambda b: b.log({name: b.table(_plain(rows))}, step))
+        if not rows:
+            return
+        self._emit({"kind": "table", "step": int(step), "name": name, "rows": rows})
+        if self._backend is not None:
+            self._guard(lambda b: b.log({name: b.table(_plain(rows))}, int(step)))
 
     def finish(self) -> None:
+        self._emit({"kind": "finish"})
+        if self._jsonl is not None:
+            self._jsonl.close()
+            self._jsonl = None
         if self._backend is not None:
             self._guard(lambda b: b.finish())
             self._backend = None
+
+    def _emit(self, record: dict[str, Any]) -> None:
+        if self._jsonl is None:
+            return
+        payload = {"project": self._project, "run": self._name, **_plain(record)}
+        self._jsonl.write(json.dumps(payload) + "\n")
+        self._jsonl.flush()
 
     def _guard(self, call) -> None:
         assert self._backend is not None
@@ -188,6 +243,7 @@ def score_scalars(prefix: str, score: Mapping[str, Any]) -> dict[str, float]:
     for label, cls in score["per_class"].items():
         out[f"{prefix}/precision/{label}"] = float(cls["precision"])
         out[f"{prefix}/recall/{label}"] = float(cls["recall"])
+        out[f"{prefix}/f1/{label}"] = float(cls["f1"])
     return out
 
 
@@ -203,4 +259,15 @@ def class_table(score: Mapping[str, Any]) -> list[dict[str, Any]]:
             "predicted": cls["predicted"],
         }
         for label, cls in score["per_class"].items()
+    ]
+
+
+def confusion_table(score: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Rows of one score's confusion matrix, with an `n` column per true label."""
+    confusion = score.get("confusion")
+    if confusion is None:
+        return []
+    return [
+        {"true": label, **{f"pred_{lab}": int(confusion[i][j]) for j, lab in enumerate(LABELS)}}
+        for i, label in enumerate(LABELS)
     ]

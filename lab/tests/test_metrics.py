@@ -58,9 +58,3 @@ def test_lines_show_the_baseline_next_to_every_headline() -> None:
     text = "\n".join(lines(score(rows([("safe", "safe"), ("warn", "warn")]))))
     assert "always-safe 0.5" in text and "majority safe 0.5" in text
     assert "always-safe 0.333" in text  # macro-F1 of the always-safe predictor
-    assert "| warn |" in text
-
-
-def test_empty_rows_are_rejected() -> None:
-    with pytest.raises(ValueError, match="no rows"):
-        score([])

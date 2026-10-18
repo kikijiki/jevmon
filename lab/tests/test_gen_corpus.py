@@ -183,10 +183,41 @@ def test_render_rows_mutates_in_place():
     assert "context" in rows[0] and "signature" in rows[0]
 
 
-def test_build_prompt_names_exact_count_and_class_sentence():
+def test_build_prompt_names_exact_count_and_requires_launch_visible_cues():
     prompt = build_prompt(CRIT_FAMILY, 7)
-    assert "7 " in prompt or "exactly 7" in prompt
-    assert "looks hostile" in prompt
+    assert "exactly 7" in prompt
+    assert "hostile cue" in prompt
+    assert "launch text alone" in prompt
+    safe = build_prompt(SAFE_FAMILY, 2)
+    assert "Safe cues" in safe
+    assert "nothing unusual in the launch" in safe
+
+
+def test_class_descriptions_define_warn_as_visible_oddness():
+    from gen_corpus_lib import CLASS_DESCRIPTIONS
+
+    assert set(CLASS_DESCRIPTIONS) == {"safe", "warn", "crit"}
+    assert "a reader can see" in CLASS_DESCRIPTIONS["warn"]
+    assert "no fetch-and-run" in CLASS_DESCRIPTIONS["warn"]
+
+
+def test_looks_like_refusal_only_flags_prose():
+    from gen_corpus_lib import looks_like_refusal
+
+    assert looks_like_refusal("I'm sorry, I cannot help with that.")
+    assert looks_like_refusal("As an AI, I am unable to assist.")
+    assert not looks_like_refusal("")
+    assert not looks_like_refusal('[{"exe": "/bin/true", "argv": ["true"]}]')
+
+
+def test_consensus_requires_blind_and_a_third_judge():
+    from gen_corpus import consensus_of
+
+    assert consensus_of({"blind_agrees": True, "jev_agrees": True})
+    assert consensus_of({"blind_agrees": True, "jev_agrees": None, "unc_agrees": True})
+    assert not consensus_of({"blind_agrees": True, "jev_agrees": False, "unc_agrees": False})
+    assert not consensus_of({"blind_agrees": False, "jev_agrees": True})
+    assert not consensus_of({"blind_agrees": True})
 
 
 def test_qa_label_handles_bad_json_gracefully():

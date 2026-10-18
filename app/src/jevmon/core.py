@@ -10,13 +10,15 @@ a schema version in `PRAGMA user_version`, day-based retention, safe from severa
 thread. Producers call `submit`; the worker moves each event to every sink.
 """
 
+import bisect
 import json
 import sqlite3
 import sys
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
 from typing import Protocol
 
@@ -223,6 +225,45 @@ class SqliteStore:
             self._conn.commit()
             return int(cur.lastrowid)
 
+    def add_events(self, events: Iterable[Event]) -> int:
+        """Insert several events in one transaction; returns how many."""
+        rows = [
+            (
+                e.time,
+                e.source,
+                e.subject,
+                e.kind,
+                int(e.severity),
+                e.message,
+                json.dumps(dict(e.fields), ensure_ascii=True, separators=(",", ":")),
+                e.command,
+            )
+            for e in events
+        ]
+        if not rows:
+            return 0
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO events "
+                "(time, source, subject, kind, severity, message, fields, command) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            self._conn.commit()
+        return len(rows)
+
+    def set_counts(self, rows: Iterable[tuple[str, str, int, float, float]]) -> None:
+        """Write absolute counts `(kind, key, count, first_time, last_time)` in one transaction."""
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO counts (kind, key, count, first_time, last_time) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(kind, key) DO UPDATE SET count = excluded.count, "
+                "last_time = excluded.last_time",
+                list(rows),
+            )
+            self._conn.commit()
+
     def prune(self, now: float | None = None) -> int:
         """Delete events and samples older than the retention window; returns events removed."""
         cutoff = (now if now is not None else time.time()) - self.retention_days * DAY
@@ -401,6 +442,148 @@ class SqliteStore:
             self._conn.close()
 
 
+class BufferedCounts:
+    """Write-behind `Counts` over a `SqliteStore`, for a source that execs hundreds of times a second.
+
+    Reads and bumps are served from memory (a key is loaded from the store the first time it is
+    touched); changed counts are written in one transaction every `flush_seconds` and on `close`.
+    The rarity samples behind the percentile live in memory only: they are a one-hour window that
+    refills after a restart (one SQL row per exec was the cost, not the number). The distinct
+    count under an edge prefix is re-read from the store at most every `prefix_ttl` seconds.
+    """
+
+    SAMPLE_CAP = 5000
+
+    def __init__(
+        self, store: SqliteStore, flush_seconds: float = 1.0, prefix_ttl: float = 2.0
+    ) -> None:
+        self.store = store
+        self.flush_seconds = flush_seconds
+        self.prefix_ttl = prefix_ttl
+        self._lock = threading.Lock()
+        self._counts: dict[tuple[str, str], list] = {}  # [count, first, last]
+        self._dirty: set[tuple[str, str]] = set()
+        self._totals: dict[str, int] = {}
+        self._distinct: dict[str, int] = {}
+        self._prefix: dict[tuple[str, str], tuple[int, float]] = {}
+        self._samples: dict[str, deque[tuple[float, float]]] = defaultdict(
+            lambda: deque(maxlen=self.SAMPLE_CAP)
+        )
+        self._sorted: dict[str, tuple[float, float, list[float]]] = {}
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, name="jevmon-counts", daemon=True)
+            self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.flush_seconds):
+            self.flush()
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(2.0)
+            self._thread = None
+        self.flush()
+
+    def flush(self) -> None:
+        with self._lock:
+            self.flush_locked()
+
+    def _load(self, kind: str, key: str) -> list:
+        entry = self._counts.get((kind, key))
+        if entry is None:
+            first = self.store.first_time(kind, key)
+            entry = [self.store.count(kind, key), first if first is not None else 0.0, 0.0]
+            self._counts[(kind, key)] = entry
+        return entry
+
+    def bump(self, kind: str, key: str, now: float | None = None) -> int:
+        stamp = now if now is not None else time.time()
+        with self._lock:
+            entry = self._load(kind, key)
+            prior = entry[0]
+            if prior == 0:
+                entry[1] = stamp
+                if kind in self._distinct:
+                    self._distinct[kind] += 1
+            entry[0] = prior + 1
+            entry[2] = stamp
+            if kind in self._totals:
+                self._totals[kind] += 1
+            self._dirty.add((kind, key))
+            return prior
+
+    def count(self, kind: str, key: str) -> int:
+        with self._lock:
+            return self._load(kind, key)[0]
+
+    def first_time(self, kind: str, key: str) -> float | None:
+        with self._lock:
+            entry = self._load(kind, key)
+            return entry[1] if entry[0] > 0 else None
+
+    def total(self, kind: str) -> int:
+        with self._lock:
+            if kind not in self._totals:
+                self.flush_locked()
+                self._totals[kind] = self.store.total(kind)
+            return self._totals[kind]
+
+    def distinct(self, kind: str) -> int:
+        with self._lock:
+            if kind not in self._distinct:
+                self.flush_locked()
+                self._distinct[kind] = self.store.distinct(kind)
+            return self._distinct[kind]
+
+    def flush_locked(self) -> None:
+        rows = [(k, key, *self._counts[(k, key)]) for k, key in self._dirty]
+        self._dirty.clear()
+        if rows:
+            self.store.set_counts(rows)
+
+    def distinct_prefix(self, kind: str, prefix: str) -> int:
+        now = time.monotonic()
+        with self._lock:
+            cached = self._prefix.get((kind, prefix))
+            if cached is not None and now - cached[1] < self.prefix_ttl:
+                return cached[0]
+            self.flush_locked()
+            value = self.store.distinct_prefix(kind, prefix)
+            if len(self._prefix) > 4096:
+                self._prefix.clear()
+            self._prefix[(kind, prefix)] = (value, now)
+            return value
+
+    def add_sample(self, kind: str, value: float, now: float | None = None) -> None:
+        with self._lock:
+            self._samples[kind].append((now if now is not None else time.time(), value))
+
+    def samples(self, kind: str, since: float) -> list[float]:
+        with self._lock:
+            return [v for t, v in self._samples[kind] if t >= since]
+
+    def rank(self, kind: str, since: float, value: float) -> float | None:
+        """Percentage of recent samples at or below `value` (None when there are none).
+
+        Uses a sorted copy of the window rebuilt at most once a second."""
+        now = time.monotonic()
+        with self._lock:
+            cached = self._sorted.get(kind)
+            if cached is None or now - cached[0] >= 1.0:
+                values = sorted(v for t, v in self._samples[kind] if t >= since)
+                cached = (now, 0.0, values)
+                self._sorted[kind] = cached
+            values = cached[2]
+        if not values:
+            return None
+        return 100.0 * bisect.bisect_right(values, value) / len(values)
+
+
 class Pipeline:
     """Drain a `BoundedQueue` into a list of sinks on one worker thread."""
 
@@ -419,10 +602,22 @@ class Pipeline:
         self._thread = threading.Thread(target=self._run, name="jevmon-pipeline", daemon=True)
         self._thread.start()
 
+    def _flush(self) -> None:
+        for sink in self.sinks:
+            flush = getattr(sink, "flush", None)
+            if callable(flush):
+                try:
+                    flush()
+                except Exception:  # noqa: BLE001, S112 - one broken sink must not stop the pipeline
+                    continue
+
     def _run(self) -> None:
+        last_flush = time.monotonic()
         while True:
-            event = self.queue.get(timeout=0.5)
+            event = self.queue.get(timeout=0.25)
             if event is None:
+                self._flush()
+                last_flush = time.monotonic()
                 if self._stop.is_set() and len(self.queue) == 0:
                     break
                 continue
@@ -431,6 +626,9 @@ class Pipeline:
                     sink.emit(event)
                 except Exception:  # noqa: BLE001, S112 - one broken sink must not stop the pipeline
                     continue
+            if time.monotonic() - last_flush >= 0.25:  # a steady stream still reaches the store
+                self._flush()
+                last_flush = time.monotonic()
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
@@ -438,6 +636,7 @@ class Pipeline:
         if self._thread is not None:
             self._thread.join(timeout)
             self._thread = None
+        self._flush()
         for sink in self.sinks:
             sink.close()
 
@@ -446,15 +645,61 @@ class Pipeline:
 
 
 class StoreSink:
-    """Persist verdict events always, and exec events when configured."""
+    """Persist verdict events always, and exec events when configured.
 
-    def __init__(self, store: SqliteStore, store_exec: bool) -> None:
+    Writes are batched (one transaction per flush). A verdict reused from the memo (`cached`)
+    for a situation already stored within `repeat_seconds` is not stored again: it is counted in
+    `coalesced` and the next stored row of that situation carries the count as `repeats`. At a few
+    hundred execs a second the same situation repeats thousands of times; the judged verdict, the
+    first sighting and one row per window are kept, and nothing is dropped uncounted.
+    """
+
+    def __init__(
+        self,
+        store: SqliteStore,
+        store_exec: bool,
+        repeat_seconds: float = 60.0,
+        max_batch: int = 500,
+    ) -> None:
         self.store = store
         self.store_exec = store_exec
+        self.repeat_seconds = repeat_seconds
+        self.max_batch = max_batch
+        self.coalesced = 0
+        self._batch: list[Event] = []
+        self._seen: dict[str, tuple[float, int]] = {}  # signature -> (last stored, skipped since)
 
     def emit(self, event: Event) -> None:
-        if event.kind == EVENT_KIND_VERDICT or (self.store_exec and event.kind == EVENT_KIND_EXEC):
-            self.store.add_event(event)
+        if event.kind == EVENT_KIND_VERDICT:
+            event = self._coalesce(event)
+            if event is None:
+                return
+        elif not (self.store_exec and event.kind == EVENT_KIND_EXEC):
+            return
+        self._batch.append(event)
+        if len(self._batch) >= self.max_batch:
+            self.flush()
+
+    def _coalesce(self, event: Event) -> Event | None:
+        if self.repeat_seconds <= 0 or not event.fields.get("cached"):
+            return event
+        signature = str(event.fields.get("signature", ""))
+        last, skipped = self._seen.get(signature, (None, 0))
+        if last is not None and event.time - last < self.repeat_seconds:
+            self._seen[signature] = (last, skipped + 1)
+            self.coalesced += 1
+            return None
+        if len(self._seen) > 20_000:
+            self._seen.clear()
+        self._seen[signature] = (event.time, 0)
+        if skipped:
+            return replace(event, fields={**event.fields, "repeats": skipped})
+        return event
+
+    def flush(self) -> None:
+        if self._batch:
+            batch, self._batch = self._batch, []
+            self.store.add_events(batch)
 
     def close(self) -> None:
-        pass
+        self.flush()

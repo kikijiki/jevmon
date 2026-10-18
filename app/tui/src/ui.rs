@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Sparkline};
 use ratatui::{Frame, Terminal};
 use unicode_width::UnicodeWidthStr;
 
+use crate::allow::Scope;
 use crate::format::{
     self, format_count, format_duration, format_interval, format_percent, format_rate,
 };
@@ -23,10 +24,11 @@ use crate::state::{App, Focus, LayoutMode, SEVERITY_NAMES};
 use crate::theme::{self, Theme};
 
 /// Footer key hints: key, label.
-const KEYS: [(&str, &str); 11] = [
+const KEYS: [(&str, &str); 12] = [
     ("t", "TP"),
     ("f", "FP"),
     ("y", "ack"),
+    ("a", "allow"),
     ("p", "pause"),
     ("/", "filter"),
     ("u", "unlab"),
@@ -89,6 +91,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.help {
         render_help(frame, area, app);
     }
+    if app.chooser.is_some() {
+        render_chooser(frame, area, app);
+    }
 }
 
 // -- header -------------------------------------------------------------------------------------
@@ -147,10 +152,30 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
             theme.text(theme::DIM, Modifier::empty()),
         ));
         left.push(Span::styled(label, theme.text(color, Modifier::BOLD)));
+        if !stats.exec_error.is_empty() {
+            left.push(Span::styled(
+                "  │  ",
+                theme.text(theme::DIM, Modifier::empty()),
+            ));
+            left.push(Span::styled(
+                clip(&sanitize::clean(&stats.exec_error, 160), 90),
+                theme.paint_mod(theme::RED, theme::CRIT_BG, Modifier::BOLD),
+            ));
+        }
         left.push(Span::styled(
             format!("  up {}", format_duration(stats.uptime)),
             theme.text(theme::DIM, Modifier::empty()),
         ));
+        if stats.allow_rules > 0 {
+            left.push(Span::styled(
+                format!(
+                    "  allow {} rules · {} skipped",
+                    format_count(stats.allow_rules),
+                    format_count(stats.allow_skipped)
+                ),
+                theme.text(theme::DIM, Modifier::empty()),
+            ));
+        }
         if stats.paused {
             left.push(Span::styled(
                 "  PAUSED",
@@ -185,6 +210,7 @@ fn render_left_right(frame: &mut Frame, area: Rect, left: Line<'static>, right: 
 // -- metrics strip ------------------------------------------------------------------------------
 
 const METRIC_LABELS: [&str; 5] = ["judged/s", "queue", "queue age", "interval", "miss"];
+const METRIC_LABELS_EBPF: [&str; 5] = ["judged/s", "queue", "queue age", "exec/s", "lost"];
 const METRIC_COLORS: [Color; 5] = [
     theme::CYAN,
     theme::MAGENTA,
@@ -195,7 +221,20 @@ const METRIC_COLORS: [Color; 5] = [
 
 fn render_metrics(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
+    let ebpf = app.metrics.stats.as_ref().is_some_and(|s| s.is_ebpf());
+    let labels = if ebpf {
+        &METRIC_LABELS_EBPF
+    } else {
+        &METRIC_LABELS
+    };
     let values: [String; 5] = match &app.metrics.stats {
+        Some(stats) if ebpf => [
+            format_rate(app.metrics.rate),
+            format_count(stats.queue_depth),
+            format_duration(stats.queue_age),
+            format_rate(stats.exec_per_s),
+            format_count(stats.exec_lost),
+        ],
         Some(stats) => [
             format_rate(app.metrics.rate),
             format_count(stats.queue_depth),
@@ -221,7 +260,7 @@ fn render_metrics(frame: &mut Frame, area: Rect, app: &App) {
             continue;
         }
         let width = usize::from(cell.width);
-        let label = METRIC_LABELS[index];
+        let label = labels[index];
         let label = clip(label, (width / 2).max(2));
         let value = clip(
             &values[index],
@@ -589,6 +628,12 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
         theme,
     );
     help_row(&mut lines, "y", "ack the selected event", theme);
+    help_row(
+        &mut lines,
+        "a",
+        "allow: skip future launches like this one (detail pane open)",
+        theme,
+    );
     lines.push(Line::default());
     help_section(&mut lines, "view", theme);
     help_row(&mut lines, "p", "pause / resume the judge", theme);
@@ -614,6 +659,89 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::default());
     help_row(&mut lines, "?", "close this help · q quit", theme);
 
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+// -- allow chooser ------------------------------------------------------------------------------
+
+fn render_chooser(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(chooser) = &app.chooser else {
+        return;
+    };
+    let theme = &app.theme;
+    let width = area.width.saturating_sub(4).min(100);
+    let inner_width = usize::from(width.saturating_sub(2));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("allow launches like #{}", chooser.event_id),
+        theme.text(theme::DIM, Modifier::empty()),
+    )));
+    lines.push(Line::default());
+    for scope in chooser.scopes() {
+        let selected = scope == chooser.scope;
+        let mut name = scope.name().to_string();
+        if scope == Scope::Prefix {
+            name = format!("prefix k={}", chooser.k);
+        }
+        let marker = if selected { "> " } else { "  " };
+        let head = format!("{marker}{name:<12}");
+        let rule = clip(
+            &chooser.rule_for(scope),
+            inner_width.saturating_sub(label_width(&head)),
+        );
+        let (head_style, rule_style) = if selected {
+            (
+                theme.text(theme::ACCENT, Modifier::BOLD),
+                theme.text(theme::FG, Modifier::BOLD),
+            )
+        } else {
+            (
+                theme.text(theme::DIM, Modifier::empty()),
+                theme.text(theme::DIM, Modifier::empty()),
+            )
+        };
+        lines.push(Line::from(vec![
+            Span::styled(head, head_style),
+            Span::styled(rule, rule_style),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "rule to add:",
+        theme.text(theme::DIM, Modifier::empty()),
+    )));
+    for row in wrap(&chooser.rule(), inner_width.saturating_sub(2)) {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(row, theme.text(theme::FG, Modifier::BOLD)),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "↑ ↓ scope · ← → / - + arguments kept · enter add · esc cancel",
+        theme.text(theme::DIM, Modifier::empty()),
+    )));
+
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .title(Span::styled(
+            " allow ",
+            theme.text(theme::ACCENT, Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.fg(theme::ACCENT)));
+    let inner = block.inner(rect);
+    let block = match theme.bg(theme::BG) {
+        Some(bg) => block.style(Style::default().bg(bg)),
+        None => block,
+    };
+    frame.render_widget(block, rect);
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
@@ -1300,6 +1428,24 @@ mod tests {
         let mut app = App::new("/run/user/1000/jevmon/jevmond.sock".to_string());
         app.theme = Theme::color();
         app
+    }
+
+    #[test]
+    fn header_says_when_the_exec_helper_is_missing() {
+        let mut app = app();
+        app.handle_msg(DaemonMsg::Connected);
+        app.handle_msg(DaemonMsg::Stats(Stats {
+            model_status: "ready".to_string(),
+            exec_source: "ebpf".to_string(),
+            exec_error: "exec source unavailable (helper not running); run: jevmon start"
+                .to_string(),
+            exec_per_s: 12.0,
+            ..Stats::default()
+        }));
+        let text = render_to_string(&mut app, 160, 30);
+        assert!(text.contains("exec source unavailable (helper not running)"));
+        assert!(text.contains("run: jevmon start"));
+        assert!(text.contains("exec/s") && text.contains("lost"));
     }
 
     #[test]

@@ -1,0 +1,36 @@
+# Persistent variant of the exec helper (`just exec-install` fills in the two placeholders).
+# `jevmon start` runs the same helper as a transient unit instead, with the same properties.
+[Unit]
+Description=jevmon exec helper (eBPF exec feed)
+Documentation=file://@REPO@/app/README.md
+
+[Service]
+Type=simple
+# The helper streams every exec on this machine, command lines included, to a unix socket. Only
+# the uid below may connect (SO_PEERCRED); the helper reads nothing from its clients.
+ExecStart=@HELPER@ --uid @UID@ --socket /run/jevmon/exec.sock
+Restart=on-failure
+RestartSec=2s
+
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE
+NoNewPrivileges=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+DevicePolicy=closed
+LimitMEMLOCK=infinity
+RuntimeDirectory=jevmon
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

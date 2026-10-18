@@ -4,6 +4,7 @@
 //! the renderer; [`main`] is only terminal setup, the key/event loop and the channel plumbing to
 //! the daemon connection task.
 
+pub mod allow;
 pub mod client;
 pub mod format;
 pub mod list;

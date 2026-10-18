@@ -101,7 +101,7 @@ def _environ(data: bytes | None) -> dict[str, str]:
 class RawExecSource(ExecSource):
     """Lab-only source: also puts the unmasked (sanitized, length-bounded) argv, exe and cwd on
     the event as `*_raw` fields, so the lab can build the model-facing text from the raw command
-    line (E15). The daemon's source never does this; lab data is synthetic."""
+    line. The daemon's source never does this; lab data is synthetic."""
 
     def _make_event(self, now, stat, argv, exe):  # type: ignore[no-untyped-def]
         event = super()._make_event(now, stat, argv, exe)
@@ -154,7 +154,7 @@ class Observation:
         self.designated = designated
         self.argv = ""  # the redacted argv the poller saw (what `designated` compared)
         self.env: dict[str, str] = {}  # raw env, parent-diff and base-diff (lab data only)
-        self.context_raw = ""  # model-facing state built from the unmasked argv (E15), if captured
+        self.context_raw = ""  # model-facing state built from the unmasked argv, if captured
 
     def as_dict(self) -> dict:
         """The raw row written to `contexts.jsonl`."""

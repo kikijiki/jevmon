@@ -40,7 +40,7 @@ def test_every_toml_block_in_the_readme_parses_and_loads(tmp_path):
         path.write_text(block, encoding="utf-8")
         config = load_config(path)  # ... and a config the loader accepts
         assert config.judge.mode in ("laya", "fake"), f"block {index}"
-        assert config.exec.source in ("proc", "replay"), f"block {index}"
+        assert config.exec.source in ("ebpf", "proc", "replay"), f"block {index}"
 
 
 def test_a_typo_in_an_example_would_be_caught(tmp_path):

@@ -1,4 +1,5 @@
 import builtins
+import json
 import os
 from pathlib import Path
 
@@ -101,6 +102,23 @@ def test_local_env_clears_sync_and_sets_dir(tmp_path, env):
     assert env["TRACKIO_DIR"] == str(tmp_path.resolve())
     assert env["GRADIO_SHARE"] == "false"
     assert env["HF_HUB_DISABLE_TELEMETRY"] == "1"
+
+
+def test_jsonl_mirror_records_config_scalars_tables(monkeypatch, tmp_path, env):
+    monkeypatch.setattr(runlog, "_load_trackio", lambda directory: None)
+    path = tmp_path / "metrics.jsonl"
+    run = RunLog.start("p", "n", {"lr": 0.2}, directory=tmp_path, jsonl=path)
+    assert not run.enabled and run.recording
+    run.log(3, **{"loss/train": 0.5, "macro_f1/dev": 0.7})
+    run.table("per_class", [{"label": "safe", "recall": 1.0}], step=4)
+    run.finish()
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert records[0] == {"project": "p", "run": "n", "kind": "config", "config": {"lr": 0.2}}
+    assert records[1]["kind"] == "scalar" and records[1]["step"] == 3
+    assert records[1]["metrics"]["loss/train"] == 0.5
+    assert records[2]["kind"] == "table" and records[2]["name"] == "per_class"
+    assert records[2]["rows"] == [{"label": "safe", "recall": 1.0}]
+    assert records[3]["kind"] == "finish"
 
 
 def test_score_scalars_carry_baselines_and_per_class():

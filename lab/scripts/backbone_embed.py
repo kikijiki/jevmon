@@ -3,8 +3,8 @@
     python scripts/backbone_embed.py NAME MODEL_ID_OR_PATH [--kind decoder|encoder] [--instruct]
         [--data DIR ...] [--max-length 512] [--device cuda]
 
-One forward pass stores several pooled variants per text (the sweep picks among them by
-train-CV): decoders give the last token and the mean of the final layer and of a layer at 3/4
+One forward pass stores several pooled variants per text (the shipped recipes read `mean+mean75`):
+decoders give the last token and the mean of the final layer and of a layer at 3/4
 depth; encoders give mean and cls of the last layer. Left padding for decoders, the end token
 appended after truncation (what the Qwen3-Embedding card prescribes). Nothing here reads labels.
 """

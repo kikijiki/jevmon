@@ -127,7 +127,7 @@ def redact_argv(
     """Redact and bound a whole argv. A bare secret flag also masks the argument that follows it.
 
     `mask=False` only sanitizes (control characters) and bounds lengths: nothing is replaced by
-    `***`. That is the model-facing form (E15); it must never be stored or emitted.
+    `***`. That is the model-facing form; it must never be stored or emitted.
     """
     out: list[str] = []
     i = 0
